@@ -34,6 +34,7 @@ dependencies = [
   "descript-audiotools==0.7.2",
   "einops>=0.8.1",
   "ffmpeg-python==0.2.0",
+  "flash-attn>=2.8.3",
   "g2p-en==2.1.0",
   "jieba==0.42.1",
   "json5==0.10.0",
@@ -47,6 +48,7 @@ dependencies = [
   "omegaconf>=2.3.0",
   "opencv-python==4.9.0.80",
   "pandas==2.3.2",
+  "peft>=0.18.0",
   "safetensors==0.5.2",
   "sentencepiece>=0.2.1",
   "tensorboard==2.9.1",
@@ -56,7 +58,6 @@ dependencies = [
   "torchaudio==2.8.*",
   "tqdm>=4.67.1",
   "transformers==4.52.1",
-
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",
   "WeTextProcessing; sys_platform == 'linux'",
@@ -70,6 +71,11 @@ webui = [
 # To install the DeepSpeed support, use `uv sync --extra deepspeed` (or `--all-extras`).
 deepspeed = [
   "deepspeed==0.17.1",
+]
+# To install training support (includes Whisper), use `uv sync --extra training`.
+training = [
+  "faster-whisper>=1.0.0",  # For automatic transcription
+  "openai-whisper>=20231117",  # Alternative Whisper implementation
 ]
 
 [project.urls]

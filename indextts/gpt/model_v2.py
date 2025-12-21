@@ -794,3 +794,10 @@ class UnifiedVoice(nn.Module):
 
         out = base_vec + alpha * (emo_vec - base_vec)
         return out
+    
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        """
+        Dummy method required by PEFT for LoRA training.
+        This is used during HuggingFace generation but not needed for our custom inference.
+        """
+        return {"input_ids": input_ids}

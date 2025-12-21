@@ -21,6 +21,7 @@ from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.lora_utils import load_lora_checkpoint
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
@@ -38,7 +39,8 @@ import torch.nn.functional as F
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
+            use_cuda_kernel=None, use_deepspeed=False, use_accel=False, use_torch_compile=False, lora_path=None,
+            gpt_checkpoint=None
     ):
         """
         Args:
@@ -50,6 +52,8 @@ class IndexTTS2:
             use_deepspeed (bool): whether to use DeepSpeed or not.
             use_accel (bool): whether to use acceleration engine for GPT2 or not.
             use_torch_compile (bool): whether to use torch.compile for optimization or not.
+            lora_path (str | None): path to LoRA checkpoint directory for fine-tuned voice adaptation. If None, uses base model.
+            gpt_checkpoint (str | None): path to custom GPT checkpoint (e.g., from full fine-tuning). If None, uses default from config.
         """
         if device is not None:
             self.device = device
@@ -83,8 +87,28 @@ class IndexTTS2:
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
         self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        
+        # Support custom GPT checkpoint (e.g., from full fine-tuning)
+        if gpt_checkpoint is not None:
+            self.gpt_path = gpt_checkpoint
+            print(f">> Using custom GPT checkpoint: {self.gpt_path}")
+        else:
+            self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        
         load_checkpoint(self.gpt, self.gpt_path)
+        
+        # Load LoRA adapters if specified
+        if lora_path is not None:
+            print(f">> Loading LoRA adapters from: {lora_path}")
+            self.gpt = load_lora_checkpoint(
+                self.gpt,
+                lora_path,
+                merge_weights=True,  # Merge weights for inference - required because
+                                     # UnifiedVoice doesn't have HuggingFace-style forward()
+                device=self.device
+            )
+            print(">> LoRA adapters loaded and merged successfully")
+        
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:
             self.gpt.eval().half()
@@ -354,18 +378,49 @@ class IndexTTS2:
         return emo_vector
 
     # 原始推理模式
-    def infer(self, spk_audio_prompt, text, output_path,
+    def infer(self, spk_audio_prompt=None, text=None, output_path=None,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
+              speaker_embeddings=None, **generation_kwargs):
+        """
+        Main inference method for text-to-speech synthesis.
+        
+        Args:
+            spk_audio_prompt: Path to speaker reference audio (optional if speaker_embeddings provided)
+            text: Text to synthesize
+            output_path: Path to save output audio
+            emo_audio_prompt: Path to emotion reference audio (optional)
+            emo_alpha: Emotion mixing weight (0.0-1.0)
+            emo_vector: Explicit emotion vector [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
+            use_emo_text: Whether to extract emotion from text
+            emo_text: Text to extract emotion from (if different from main text)
+            use_random: Use random emotion sampling
+            interval_silence: Silence between segments in ms
+            verbose: Print debug information
+            max_text_tokens_per_segment: Maximum tokens per synthesis segment
+            stream_return: Return audio as generator
+            speaker_embeddings: Pre-computed speaker embeddings dict (for promptless inference)
+                Keys: 'spk_cond_emb', 'style', 'prompt_condition', 'ref_mel', 'emo_cond_emb'
+            **generation_kwargs: Additional generation parameters
+            
+        Returns:
+            Output path or audio tensor
+        """
+        # Validate inputs
+        if spk_audio_prompt is None and speaker_embeddings is None:
+            raise ValueError("Either spk_audio_prompt or speaker_embeddings must be provided")
+        if text is None:
+            raise ValueError("text is required")
         if stream_return:
             return self.infer_generator(
                 spk_audio_prompt, text, output_path,
                 emo_audio_prompt, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
-                verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                speaker_embeddings=speaker_embeddings, **generation_kwargs
             )
         else:
             try:
@@ -374,7 +429,8 @@ class IndexTTS2:
                     emo_audio_prompt, emo_alpha,
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
-                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
+                    verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
+                    speaker_embeddings=speaker_embeddings, **generation_kwargs
                 ))[0]
             except IndexError:
                 return None
@@ -383,7 +439,8 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
+              speaker_embeddings=None, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -417,57 +474,80 @@ class IndexTTS2:
                 emo_vector = [int(x * emo_vector_scale * 10000) / 10000 for x in emo_vector]
                 print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
 
-        if emo_audio_prompt is None:
-            # we are not using any external "emotion reference voice"; use
-            # speaker's voice as the main emotion reference audio.
-            emo_audio_prompt = spk_audio_prompt
-            # must always use alpha=1.0 when we don't have an external reference voice
-            emo_alpha = 1.0
-
-        # 如果参考音频改变了，才需要重新生成, 提升速度
-        if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
-            if self.cache_spk_cond is not None:
-                self.cache_spk_cond = None
-                self.cache_s2mel_style = None
-                self.cache_s2mel_prompt = None
-                self.cache_mel = None
-                torch.cuda.empty_cache()
-            audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
-            audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-            audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
-
-            inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-            input_features = inputs["input_features"]
-            attention_mask = inputs["attention_mask"]
-            input_features = input_features.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            spk_cond_emb = self.get_emb(input_features, attention_mask)
-
-            _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                     num_mel_bins=80,
-                                                     dither=0,
-                                                     sample_frequency=16000)
-            feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-            style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
-
-            prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                     ylens=ref_target_lengths,
-                                                                     n_quantizers=3,
-                                                                     f0=None)[0]
-
+        # ======== SPEAKER EMBEDDINGS SUPPORT ========
+        # Use pre-computed embeddings for promptless inference if provided
+        if speaker_embeddings is not None:
+            print(">> Using pre-computed speaker embeddings (promptless inference)")
+            spk_cond_emb = speaker_embeddings['spk_cond_emb'].to(self.device)
+            style = speaker_embeddings['style'].to(self.device)
+            prompt_condition = speaker_embeddings['prompt_condition'].to(self.device)
+            ref_mel = speaker_embeddings['ref_mel'].to(self.device)
+            emo_cond_emb = speaker_embeddings.get('emo_cond_emb', spk_cond_emb).to(self.device)
+            
+            # Cache these embeddings
             self.cache_spk_cond = spk_cond_emb
             self.cache_s2mel_style = style
             self.cache_s2mel_prompt = prompt_condition
-            self.cache_spk_audio_prompt = spk_audio_prompt
             self.cache_mel = ref_mel
+            self.cache_emo_cond = emo_cond_emb
+            self.cache_spk_audio_prompt = "__speaker_embeddings__"
+            self.cache_emo_audio_prompt = "__speaker_embeddings__"
+            
+            # No need to process audio files
+            emo_audio_prompt = None
         else:
-            style = self.cache_s2mel_style
-            prompt_condition = self.cache_s2mel_prompt
-            spk_cond_emb = self.cache_spk_cond
-            ref_mel = self.cache_mel
+            # Original audio-based processing
+            if emo_audio_prompt is None:
+                # we are not using any external "emotion reference voice"; use
+                # speaker's voice as the main emotion reference audio.
+                emo_audio_prompt = spk_audio_prompt
+                # must always use alpha=1.0 when we don't have an external reference voice
+                emo_alpha = 1.0
+
+            # 如果参考音频改变了，才需要重新生成, 提升速度
+            if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+                if self.cache_spk_cond is not None:
+                    self.cache_spk_cond = None
+                    self.cache_s2mel_style = None
+                    self.cache_s2mel_prompt = None
+                    self.cache_mel = None
+                    torch.cuda.empty_cache()
+                audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
+                audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+                audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+                inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+                input_features = inputs["input_features"]
+                attention_mask = inputs["attention_mask"]
+                input_features = input_features.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+                _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+                ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+                feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
+                                                         num_mel_bins=80,
+                                                         dither=0,
+                                                         sample_frequency=16000)
+                feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
+                style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
+
+                prompt_condition = self.s2mel.models['length_regulator'](S_ref,
+                                                                         ylens=ref_target_lengths,
+                                                                         n_quantizers=3,
+                                                                         f0=None)[0]
+
+                self.cache_spk_cond = spk_cond_emb
+                self.cache_s2mel_style = style
+                self.cache_s2mel_prompt = prompt_condition
+                self.cache_spk_audio_prompt = spk_audio_prompt
+                self.cache_mel = ref_mel
+            else:
+                style = self.cache_s2mel_style
+                prompt_condition = self.cache_s2mel_prompt
+                spk_cond_emb = self.cache_spk_cond
+                ref_mel = self.cache_mel
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector, device=self.device)
@@ -482,22 +562,24 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-            if self.cache_emo_cond is not None:
-                self.cache_emo_cond = None
-                torch.cuda.empty_cache()
-            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+        # Process emotion conditioning (skip if using speaker_embeddings which already set emo_cond_emb)
+        if speaker_embeddings is None:
+            if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+                if self.cache_emo_cond is not None:
+                    self.cache_emo_cond = None
+                    torch.cuda.empty_cache()
+                emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
+                emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"]
+                emo_attention_mask = emo_inputs["attention_mask"]
+                emo_input_features = emo_input_features.to(self.device)
+                emo_attention_mask = emo_attention_mask.to(self.device)
+                emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
 
-            self.cache_emo_cond = emo_cond_emb
-            self.cache_emo_audio_prompt = emo_audio_prompt
-        else:
-            emo_cond_emb = self.cache_emo_cond
+                self.cache_emo_cond = emo_cond_emb
+                self.cache_emo_audio_prompt = emo_audio_prompt
+            else:
+                emo_cond_emb = self.cache_emo_cond
 
         self._set_gr_progress(0.1, "text processing...")
         text_tokens_list = self.tokenizer.tokenize(text)
@@ -552,8 +634,8 @@ class IndexTTS2:
                     emovec = self.gpt.merge_emovec(
                         spk_cond_emb,
                         emo_cond_emb,
-                        torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                        torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        torch.tensor([spk_cond_emb.shape[1]], device=text_tokens.device),
+                        torch.tensor([emo_cond_emb.shape[1]], device=text_tokens.device),
                         alpha=emo_alpha
                     )
 
@@ -565,8 +647,8 @@ class IndexTTS2:
                         spk_cond_emb,
                         text_tokens,
                         emo_cond_emb,
-                        cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                        emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        cond_lengths=torch.tensor([spk_cond_emb.shape[1]], device=text_tokens.device),
+                        emo_cond_lengths=torch.tensor([emo_cond_emb.shape[1]], device=text_tokens.device),
                         emo_vec=emovec,
                         do_sample=True,
                         top_p=top_p,
@@ -624,8 +706,8 @@ class IndexTTS2:
                         codes,
                         torch.tensor([codes.shape[-1]], device=text_tokens.device),
                         emo_cond_emb,
-                        cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                        emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        cond_mel_lengths=torch.tensor([spk_cond_emb.shape[1]], device=text_tokens.device),
+                        emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[1]], device=text_tokens.device),
                         emo_vec=emovec,
                         use_speed=use_speed,
                     )
