@@ -376,7 +376,7 @@ async def stream_speech(
             tmp_audio_path = tmp_audio.name
     
     async def generate_chunks():
-        """Generator for streaming audio chunks"""
+        """OPTIMIZED generator for streaming audio chunks with minimal latency"""
         try:
             if request.use_patterns and request.speaker:
                 # Pattern-aware streaming
@@ -406,7 +406,7 @@ async def stream_speech(
                     store = SpeakerEmbeddingStore(tts_model)
                     speaker_embeddings = store.load_embeddings(speaker_emb_path)
                 
-                # Stream generation
+                # Stream generation with optimized parameters
                 audio_gen = pattern_aware_inference(
                     tts=tts_model,
                     pattern_embedding=pattern_embedding,
@@ -420,11 +420,36 @@ async def stream_speech(
                     stream_return=True
                 )
                 
+                # OPTIMIZED: Stream raw PCM int16 bytes directly (no WAV overhead)
+                # Client can reconstruct WAV header or play raw PCM
+                chunk_idx = 0
                 for chunk in audio_gen:
                     if chunk is not None:
-                        # Convert tensor to bytes
-                        chunk_bytes = chunk.numpy().tobytes()
-                        yield chunk_bytes
+                        # Convert float tensor directly to int16 bytes
+                        chunk_int16 = torch.clamp(32767 * chunk, -32767.0, 32767.0).type(torch.int16)
+                        
+                        # For first chunk, send WAV header
+                        if chunk_idx == 0:
+                            import io
+                            import wave
+                            # Send a minimal WAV header (44 bytes)
+                            # Client will receive header + data stream
+                            wav_io = io.BytesIO()
+                            with wave.open(wav_io, 'wb') as wav_file:
+                                wav_file.setnchannels(1)  # Mono
+                                wav_file.setsampwidth(2)  # 16-bit
+                                wav_file.setframerate(22050)
+                                # Write a dummy frame to create header
+                                wav_file.writeframes(b'\x00\x00')
+                            
+                            # Extract just the header (44 bytes for WAV)
+                            wav_io.seek(0)
+                            header = wav_io.read(44)
+                            yield header
+                        
+                        # Stream raw PCM data (much faster than encoding each chunk)
+                        yield chunk_int16.cpu().numpy().tobytes()
+                        chunk_idx += 1
             else:
                 # Standard streaming
                 audio_gen = tts_model.infer(
@@ -437,10 +462,27 @@ async def stream_speech(
                     stream_return=True
                 )
                 
+                chunk_idx = 0
                 for chunk in audio_gen:
                     if chunk is not None:
-                        chunk_bytes = chunk.numpy().tobytes()
-                        yield chunk_bytes
+                        chunk_int16 = torch.clamp(32767 * chunk, -32767.0, 32767.0).type(torch.int16)
+                        
+                        if chunk_idx == 0:
+                            import io
+                            import wave
+                            wav_io = io.BytesIO()
+                            with wave.open(wav_io, 'wb') as wav_file:
+                                wav_file.setnchannels(1)
+                                wav_file.setsampwidth(2)
+                                wav_file.setframerate(22050)
+                                wav_file.writeframes(b'\x00\x00')
+                            
+                            wav_io.seek(0)
+                            header = wav_io.read(44)
+                            yield header
+                        
+                        yield chunk_int16.cpu().numpy().tobytes()
+                        chunk_idx += 1
         
         finally:
             # Cleanup

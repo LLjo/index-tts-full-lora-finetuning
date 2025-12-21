@@ -462,32 +462,70 @@ async function streamSpeech() {
             throw new Error(errorText || 'Streaming failed');
         }
 
-        // Read and play chunks in real-time
+        // Read and combine WAV chunks as they arrive
         const reader = response.body.getReader();
         const chunks = [];
         let receivedLength = 0;
+        let chunkCount = 0;
+
+        console.log('Starting to receive audio chunks...');
 
         while (true) {
             const { done, value } = await reader.read();
             
-            if (done) break;
+            if (done) {
+                console.log(`Stream complete. Received ${chunkCount} chunks, ${receivedLength} bytes total`);
+                break;
+            }
             
             chunks.push(value);
             receivedLength += value.length;
+            chunkCount++;
             
-            showProgress(`Streaming... ${(receivedLength / 1024).toFixed(1)} KB`, 50);
+            const progressPercent = Math.min(90, 30 + chunkCount * 10); // Progressive increase
+            showProgress(`Streaming chunk ${chunkCount}... ${(receivedLength / 1024).toFixed(1)} KB`, progressPercent);
+            console.log(`Received chunk ${chunkCount}: ${value.length} bytes`);
         }
 
-        // Combine all chunks
-        const audioData = new Uint8Array(receivedLength);
+        // Extract audio data from WAV chunks (skip headers except first)
+        console.log('Combining audio chunks...');
+        const audioDataChunks = [];
+        let totalAudioData = 0;
+        
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            if (i === 0) {
+                // First chunk: keep entire WAV file including header
+                audioDataChunks.push(chunk);
+                totalAudioData += chunk.length;
+            } else {
+                // Subsequent chunks: skip 44-byte WAV header, just get audio data
+                const headerSize = 44;
+                if (chunk.length > headerSize) {
+                    const audioOnly = chunk.slice(headerSize);
+                    audioDataChunks.push(audioOnly);
+                    totalAudioData += audioOnly.length;
+                }
+            }
+        }
+        
+        // Combine into single array
+        const combinedAudio = new Uint8Array(totalAudioData);
         let position = 0;
-        for (const chunk of chunks) {
-            audioData.set(chunk, position);
+        for (const chunk of audioDataChunks) {
+            combinedAudio.set(chunk, position);
             position += chunk.length;
         }
+        
+        // Update WAV header with correct size
+        const view = new DataView(combinedAudio.buffer);
+        // Update ChunkSize (file size - 8)
+        view.setUint32(4, combinedAudio.length - 8, true);
+        // Update Subchunk2Size (data size)
+        view.setUint32(40, combinedAudio.length - 44, true);
 
         // Create blob and play
-        const audioBlob = new Blob([audioData], { type: 'audio/wav' });
+        const audioBlob = new Blob([combinedAudio], { type: 'audio/wav' });
         const audioUrl = URL.createObjectURL(audioBlob);
 
         if (currentAudioUrl) {
@@ -697,15 +735,35 @@ function hideProgress() {
 }
 
 function showNotification(message, type = 'info') {
-    // Simple alert for now - can be enhanced with a toast notification system
-    const emoji = {
+    // 1. Ensure a container exists on the page
+    let container = document.getElementById('notification-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'notification-container';
+        document.body.appendChild(container);
+    }
+
+    const emojis = {
         'success': '✅',
         'error': '❌',
         'warning': '⚠️',
         'info': 'ℹ️'
     };
-    
-    alert(`${emoji[type] || 'ℹ️'} ${message}`);
+
+    // 2. Create the toast element
+    const toast = document.createElement('div');
+    toast.className = `toast-notification toast-${type}`;
+    toast.innerHTML = `<span>${emojis[type] || 'ℹ️'}</span> <span>${message}</span>`;
+
+    // 3. Add to container
+    container.appendChild(toast);
+
+    // 4. Automatically remove after 3 seconds
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transition = 'opacity 0.5s ease';
+        setTimeout(() => toast.remove(), 500);
+    }, 3000);
 }
 
 // Cleanup on page unload
