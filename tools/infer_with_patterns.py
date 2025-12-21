@@ -468,7 +468,7 @@ def pattern_aware_inference(
             print(f"  Normalized emotion vector: {emo_vector}")
     
     # === STEP 1: Get base conditioning ===
-    if audio_prompt is not None:
+    if audio_prompt is not None and audio_prompt != "":
         # Extract from audio file
         audio, sr = librosa.load(audio_prompt, sr=None, mono=True)
         audio = audio[:int(15 * sr)]  # Max 15s
@@ -482,36 +482,43 @@ def pattern_aware_inference(
         input_features = inputs["input_features"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
         
+        # Determine autocast settings for conditioning extraction
+        use_autocast = tts.dtype is not None and device.type == 'cuda'
+        
         with torch.no_grad():
-            spk_cond_emb = tts.get_emb(input_features, attention_mask)
-            
-            cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
-            gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-            
-            # Emotion conditioning
-            emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-            emo_vec = tts.gpt.emovec_layer(emo_cond)
-            emo_vec = tts.gpt.emo_layer(emo_vec)
-            
-            # S2Mel features
-            _, S_ref = tts.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = tts.mel_fn(audio_22k.to(device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device)
-            
-            feat = torchaudio.compliance.kaldi.fbank(
-                audio_16k.to(device),
-                num_mel_bins=80,
-                dither=0,
-                sample_frequency=16000
-            )
-            feat = feat - feat.mean(dim=0, keepdim=True)
-            style = tts.campplus_model(feat.unsqueeze(0))
-            
-            prompt_condition = tts.s2mel.models['length_regulator'](
-                S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None
-            )[0]
+            with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
+                spk_cond_emb = tts.get_emb(input_features, attention_mask)
+                
+                cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
+                gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                
+                # Emotion conditioning
+                emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                emo_vec = tts.gpt.emovec_layer(emo_cond)
+                emo_vec = tts.gpt.emo_layer(emo_vec)
+                
+                # S2Mel features
+                _, S_ref = tts.semantic_codec.quantize(spk_cond_emb)
+                ref_mel = tts.mel_fn(audio_22k.to(device).float())
+                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device)
+                
+                feat = torchaudio.compliance.kaldi.fbank(
+                    audio_16k.to(device),
+                    num_mel_bins=80,
+                    dither=0,
+                    sample_frequency=16000
+                )
+                feat = feat - feat.mean(dim=0, keepdim=True)
+                style = tts.campplus_model(feat.unsqueeze(0))
+                
+                prompt_condition = tts.s2mel.models['length_regulator'](
+                    S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None
+                )[0]
     else:
         # Use pre-computed embeddings
+        if speaker_embeddings is None:
+            raise ValueError("Either audio_prompt or speaker_embeddings must be provided")
+        
         spk_cond_emb = speaker_embeddings['spk_cond_emb'].to(device)
         gpt_conditioning = speaker_embeddings.get('gpt_conditioning')
         emo_vec = speaker_embeddings.get('emo_cond_emb', spk_cond_emb).to(device)
@@ -519,16 +526,23 @@ def pattern_aware_inference(
         prompt_condition = speaker_embeddings['prompt_condition'].to(device)
         ref_mel = speaker_embeddings['ref_mel'].to(device)
         
+        # Determine autocast settings
+        use_autocast = tts.dtype is not None and device.type == 'cuda'
+        
         # Extract GPT conditioning if not cached
         if gpt_conditioning is None:
             cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
             with torch.no_grad():
-                gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-                emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-                emo_vec = tts.gpt.emovec_layer(emo_cond)
-                emo_vec = tts.gpt.emo_layer(emo_vec)
+                with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
+                    gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                    emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                    emo_vec = tts.gpt.emovec_layer(emo_cond)
+                    emo_vec = tts.gpt.emo_layer(emo_vec)
         else:
             gpt_conditioning = gpt_conditioning.to(device)
+    
+    # Determine autocast settings (may not be set if we came from pre-computed embeddings path)
+    use_autocast = tts.dtype is not None and device.type == 'cuda'
     
     # Handle emotion reference audio
     if emotion_audio is not None:
@@ -538,18 +552,19 @@ def pattern_aware_inference(
         emo_audio_tensor = torch.from_numpy(emo_audio_16k).unsqueeze(0)
         
         with torch.no_grad():
-            emo_inputs = tts.extract_features(emo_audio_tensor, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"].to(device)
-            emo_attention_mask = emo_inputs["attention_mask"].to(device)
-            emo_emb = tts.get_emb(emo_input_features, emo_attention_mask)
-            
-            emo_cond_lengths = torch.tensor([emo_emb.shape[1]], device=device)
-            new_emo = tts.gpt.get_emo_conditioning(emo_emb.transpose(1, 2), emo_cond_lengths)
-            new_emo = tts.gpt.emovec_layer(new_emo)
-            new_emo = tts.gpt.emo_layer(new_emo)
-            
-            # Blend emotions
-            emo_vec = emo_vec + emotion_alpha * (new_emo - emo_vec)
+            with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
+                emo_inputs = tts.extract_features(emo_audio_tensor, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"].to(device)
+                emo_attention_mask = emo_inputs["attention_mask"].to(device)
+                emo_emb = tts.get_emb(emo_input_features, emo_attention_mask)
+                
+                emo_cond_lengths = torch.tensor([emo_emb.shape[1]], device=device)
+                new_emo = tts.gpt.get_emo_conditioning(emo_emb.transpose(1, 2), emo_cond_lengths)
+                new_emo = tts.gpt.emovec_layer(new_emo)
+                new_emo = tts.gpt.emo_layer(new_emo)
+                
+                # Blend emotions
+                emo_vec = emo_vec + emotion_alpha * (new_emo - emo_vec)
     
     # Handle explicit emotion vector (from emo_vector or use_emo_text)
     emovec_mat = None
@@ -634,8 +649,7 @@ def pattern_aware_inference(
     input_ids, inputs_embeds, attention_mask = tts.gpt.prepare_gpt_inputs(conds_latent, text_tokens)
     tts.gpt.inference_model.store_mel_emb(inputs_embeds)
     
-    # Determine autocast settings
-    use_autocast = tts.dtype is not None and device.type == 'cuda'
+    # Note: use_autocast was already determined above
     
     with torch.no_grad():
         with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
@@ -787,7 +801,7 @@ def _pattern_aware_inference_streaming(
         emo_vector = tts.normalize_emo_vec(emo_vector)
     
     # === Get base conditioning ===
-    if audio_prompt is not None:
+    if audio_prompt is not None and audio_prompt != "":
         audio, sr = librosa.load(audio_prompt, sr=None, mono=True)
         audio = audio[:int(15 * sr)]
         
@@ -799,32 +813,39 @@ def _pattern_aware_inference_streaming(
         input_features = inputs["input_features"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
         
+        # Determine autocast settings
+        use_autocast = tts.dtype is not None and device.type == 'cuda'
+        
         with torch.no_grad():
-            spk_cond_emb = tts.get_emb(input_features, attention_mask)
-            cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
-            gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-            
-            emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-            emo_vec = tts.gpt.emovec_layer(emo_cond)
-            emo_vec = tts.gpt.emo_layer(emo_vec)
-            
-            _, S_ref = tts.semantic_codec.quantize(spk_cond_emb)
-            ref_mel = tts.mel_fn(audio_22k.to(device).float())
-            ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device)
-            
-            feat = torchaudio.compliance.kaldi.fbank(
-                audio_16k.to(device),
-                num_mel_bins=80,
-                dither=0,
-                sample_frequency=16000
-            )
-            feat = feat - feat.mean(dim=0, keepdim=True)
-            style = tts.campplus_model(feat.unsqueeze(0))
-            
-            prompt_condition = tts.s2mel.models['length_regulator'](
-                S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None
-            )[0]
+            with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
+                spk_cond_emb = tts.get_emb(input_features, attention_mask)
+                cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
+                gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                
+                emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                emo_vec = tts.gpt.emovec_layer(emo_cond)
+                emo_vec = tts.gpt.emo_layer(emo_vec)
+                
+                _, S_ref = tts.semantic_codec.quantize(spk_cond_emb)
+                ref_mel = tts.mel_fn(audio_22k.to(device).float())
+                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device)
+                
+                feat = torchaudio.compliance.kaldi.fbank(
+                    audio_16k.to(device),
+                    num_mel_bins=80,
+                    dither=0,
+                    sample_frequency=16000
+                )
+                feat = feat - feat.mean(dim=0, keepdim=True)
+                style = tts.campplus_model(feat.unsqueeze(0))
+                
+                prompt_condition = tts.s2mel.models['length_regulator'](
+                    S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None
+                )[0]
     else:
+        if speaker_embeddings is None:
+            raise ValueError("Either audio_prompt or speaker_embeddings must be provided")
+        
         spk_cond_emb = speaker_embeddings['spk_cond_emb'].to(device)
         gpt_conditioning = speaker_embeddings.get('gpt_conditioning')
         emo_vec = speaker_embeddings.get('emo_cond_emb', spk_cond_emb).to(device)
@@ -832,15 +853,22 @@ def _pattern_aware_inference_streaming(
         prompt_condition = speaker_embeddings['prompt_condition'].to(device)
         ref_mel = speaker_embeddings['ref_mel'].to(device)
         
+        # Determine autocast settings
+        use_autocast = tts.dtype is not None and device.type == 'cuda'
+        
         if gpt_conditioning is None:
             cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
             with torch.no_grad():
-                gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-                emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
-                emo_vec = tts.gpt.emovec_layer(emo_cond)
-                emo_vec = tts.gpt.emo_layer(emo_vec)
+                with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
+                    gpt_conditioning = tts.gpt.get_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                    emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
+                    emo_vec = tts.gpt.emovec_layer(emo_cond)
+                    emo_vec = tts.gpt.emo_layer(emo_vec)
         else:
             gpt_conditioning = gpt_conditioning.to(device)
+    
+    # Determine autocast settings (may not be set if we came from pre-computed embeddings path)
+    use_autocast = tts.dtype is not None and device.type == 'cuda'
     
     # Handle emotion reference audio
     if emotion_audio is not None:
@@ -850,17 +878,18 @@ def _pattern_aware_inference_streaming(
         emo_audio_tensor = torch.from_numpy(emo_audio_16k).unsqueeze(0)
         
         with torch.no_grad():
-            emo_inputs = tts.extract_features(emo_audio_tensor, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"].to(device)
-            emo_attention_mask = emo_inputs["attention_mask"].to(device)
-            emo_emb = tts.get_emb(emo_input_features, emo_attention_mask)
-            
-            emo_cond_lengths = torch.tensor([emo_emb.shape[1]], device=device)
-            new_emo = tts.gpt.get_emo_conditioning(emo_emb.transpose(1, 2), emo_cond_lengths)
-            new_emo = tts.gpt.emovec_layer(new_emo)
-            new_emo = tts.gpt.emo_layer(new_emo)
-            
-            emo_vec = emo_vec + emotion_alpha * (new_emo - emo_vec)
+            with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
+                emo_inputs = tts.extract_features(emo_audio_tensor, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"].to(device)
+                emo_attention_mask = emo_inputs["attention_mask"].to(device)
+                emo_emb = tts.get_emb(emo_input_features, emo_attention_mask)
+                
+                emo_cond_lengths = torch.tensor([emo_emb.shape[1]], device=device)
+                new_emo = tts.gpt.get_emo_conditioning(emo_emb.transpose(1, 2), emo_cond_lengths)
+                new_emo = tts.gpt.emovec_layer(new_emo)
+                new_emo = tts.gpt.emo_layer(new_emo)
+                
+                emo_vec = emo_vec + emotion_alpha * (new_emo - emo_vec)
     
     # Handle explicit emotion vector
     emovec_mat = None
@@ -922,7 +951,7 @@ def _pattern_aware_inference_streaming(
     input_ids, inputs_embeds, attention_mask = tts.gpt.prepare_gpt_inputs(conds_latent, text_tokens)
     tts.gpt.inference_model.store_mel_emb(inputs_embeds)
     
-    use_autocast = tts.dtype is not None and device.type == 'cuda'
+    # Note: use_autocast was already set above
     
     with torch.no_grad():
         with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
@@ -1000,6 +1029,7 @@ def _pattern_aware_inference_streaming(
         wav = tts.bigvgan(vc_target.float()).squeeze()
     
     # Yield the audio chunk
+    print('YIELDD')
     wav = wav.cpu().unsqueeze(0)
     yield wav
 

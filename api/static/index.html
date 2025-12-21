@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IndexTTS - Advanced Text-to-Speech</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <h1>🎙️ IndexTTS</h1>
+                <p>Advanced Pattern-Aware Text-to-Speech</p>
+            </div>
+            <div class="status-indicator">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </header>
+
+        <!-- Model Loading Alert -->
+        <div class="card" id="modelLoadingCard" style="display: none; background: linear-gradient(135deg, #ffeaa7, #fdcb6e); border-left: 4px solid #e17055;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+                <div>
+                    <h3 style="margin: 0 0 10px 0; color: #2d3436;">⚠️ Base Model Not Loaded</h3>
+                    <p style="margin: 0; color: #2d3436;">The TTS model needs to be loaded before you can generate speech. Click the button to load the base model.</p>
+                </div>
+                <button class="btn btn-primary btn-large" id="loadBaseModelBtn" style="white-space: nowrap;">
+                    <span class="btn-icon">📦</span> Load Base Model
+                </button>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Tab Navigation -->
+            <div class="tabs">
+                <button class="tab-button active" data-tab="inference">
+                    <span class="tab-icon">🎵</span>
+                    Inference
+                </button>
+                <button class="tab-button" data-tab="training">
+                    <span class="tab-icon">🎓</span>
+                    Training
+                </button>
+                <button class="tab-button" data-tab="models">
+                    <span class="tab-icon">📦</span>
+                    Models
+                </button>
+            </div>
+
+            <!-- Inference Tab -->
+            <div class="tab-content active" id="inference">
+                <div class="card">
+                    <h2>Generate Speech</h2>
+                    
+                    <div class="form-group">
+                        <label for="inferenceText">Text to Synthesize</label>
+                        <textarea id="inferenceText" rows="4" placeholder="Enter the text you want to convert to speech...">Hello, this is a test of the IndexTTS system with pattern embeddings.</textarea>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="referenceAudio">Speaker Reference Audio</label>
+                            <div class="file-upload">
+                                <input type="file" id="referenceAudio" accept="audio/*">
+                                <span class="file-name" id="referenceAudioName">No file selected</span>
+                            </div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="speakerSelect">Or Select Trained Speaker</label>
+                            <select id="speakerSelect">
+                                <option value="">None (use audio file)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="usePatternsCheckbox">
+                            Use Pattern Embeddings (requires trained speaker)
+                        </label>
+                    </div>
+
+                    <!-- Advanced Options -->
+                    <details class="advanced-options">
+                        <summary>Advanced Options</summary>
+                        
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="temperature">Temperature: <span id="tempValue">0.8</span></label>
+                                <input type="range" id="temperature" min="0.1" max="2.0" step="0.1" value="0.8">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="topP">Top P: <span id="topPValue">0.8</span></label>
+                                <input type="range" id="topP" min="0.0" max="1.0" step="0.05" value="0.8">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="topK">Top K: <span id="topKValue">30</span></label>
+                                <input type="range" id="topK" min="0" max="100" step="5" value="30">
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="useEmoText">
+                                Extract Emotion from Text
+                            </label>
+                        </div>
+
+                        <div class="form-group" id="emoTextGroup" style="display: none;">
+                            <label for="emotionText">Custom Emotion Text (optional)</label>
+                            <input type="text" id="emotionText" placeholder="e.g., very happy and excited">
+                        </div>
+
+                        <div class="form-group">
+                            <label>Emotion Vector (8 values: Happy, Angry, Sad, Afraid, Disgusted, Melancholic, Surprised, Calm)</label>
+                            <div class="emotion-sliders">
+                                <div class="emotion-slider">
+                                    <label>😊 Happy: <span id="emoHappy">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="0" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>😠 Angry: <span id="emoAngry">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="1" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>😢 Sad: <span id="emoSad">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="2" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>😨 Afraid: <span id="emoAfraid">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="3" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>🤢 Disgusted: <span id="emoDisgusted">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="4" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>😔 Melancholic: <span id="emoMelancholic">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="5" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>😲 Surprised: <span id="emoSurprised">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="6" min="0" max="1" step="0.05" value="0">
+                                </div>
+                                <div class="emotion-slider">
+                                    <label>😌 Calm: <span id="emoCalm">0.0</span></label>
+                                    <input type="range" class="emo-slider" data-index="7" min="0" max="1" step="0.05" value="0">
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <div class="button-group">
+                        <button class="btn btn-primary" id="generateBtn">
+                            <span class="btn-icon">🎵</span> Generate Speech
+                        </button>
+                        <button class="btn btn-secondary" id="streamBtn">
+                            <span class="btn-icon">📡</span> Stream Speech
+                        </button>
+                    </div>
+
+                    <div id="inferenceProgress" class="progress-container" style="display: none;">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="inferenceProgressFill"></div>
+                        </div>
+                        <p id="inferenceProgressText">Generating...</p>
+                    </div>
+
+                    <div id="audioOutput" class="audio-output" style="display: none;">
+                        <h3>Generated Audio</h3>
+                        <audio controls id="audioPlayer"></audio>
+                        <button class="btn btn-small" id="downloadBtn">
+                            <span class="btn-icon">💾</span> Download
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Training Tab -->
+            <div class="tab-content" id="training">
+                <div class="card">
+                    <h2>Train New Speaker Model</h2>
+                    
+                    <div class="form-group">
+                        <label for="speakerName">Speaker Name</label>
+                        <input type="text" id="speakerName" placeholder="e.g., john_doe">
+                        <small>Only letters, numbers, and underscores</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="trainingFiles">Training Audio Files (minimum 5)</label>
+                        <div class="file-upload">
+                            <input type="file" id="trainingFiles" accept="audio/*" multiple>
+                            <span class="file-name" id="trainingFilesName">No files selected</span>
+                        </div>
+                        <small>Upload WAV, MP3, or FLAC files of the speaker</small>
+                    </div>
+
+                    <div id="fileList" class="file-list"></div>
+
+                    <!-- Training Parameters -->
+                    <details class="advanced-options" open>
+                        <summary>Training Parameters</summary>
+                        
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="epochs">Epochs: <span id="epochsValue">40</span></label>
+                                <input type="range" id="epochs" min="10" max="200" step="10" value="40">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="patternTokens">Pattern Tokens: <span id="patternTokensValue">8</span></label>
+                                <input type="range" id="patternTokens" min="4" max="32" step="4" value="8">
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="loraRank">LoRA Rank: <span id="loraRankValue">32</span></label>
+                                <input type="range" id="loraRank" min="8" max="128" step="8" value="32">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="batchSize">Batch Size: <span id="batchSizeValue">4</span></label>
+                                <input type="range" id="batchSize" min="1" max="16" step="1" value="4">
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="whisperModel">Whisper Model</label>
+                            <select id="whisperModel">
+                                <option value="tiny">Tiny (fastest)</option>
+                                <option value="base">Base</option>
+                                <option value="small">Small</option>
+                                <option value="medium" selected>Medium (recommended)</option>
+                                <option value="large">Large</option>
+                                <option value="large-v3">Large-v3 (best)</option>
+                            </select>
+                        </div>
+                    </details>
+
+                    <button class="btn btn-primary btn-large" id="startTrainingBtn">
+                        <span class="btn-icon">🚀</span> Start Training
+                    </button>
+                </div>
+
+                <!-- Training Tasks -->
+                <div class="card" id="trainingTasksCard" style="display: none;">
+                    <h2>Training Tasks</h2>
+                    <div id="trainingTasksList"></div>
+                </div>
+            </div>
+
+            <!-- Models Tab -->
+            <div class="tab-content" id="models">
+                <div class="card">
+                    <h2>Available Models</h2>
+                    <button class="btn btn-secondary" id="refreshModelsBtn">
+                        <span class="btn-icon">🔄</span> Refresh
+                    </button>
+                    <div id="modelsList" class="models-list"></div>
+                </div>
+
+                <div class="card">
+                    <h2>Available Speakers</h2>
+                    <div id="speakersList" class="speakers-list"></div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>&copy; 2025 IndexTTS API - Pattern-Aware Text-to-Speech</p>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

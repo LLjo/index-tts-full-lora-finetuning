@@ -108,6 +108,8 @@ class IndexTTS2:
                 device=self.device
             )
             print(">> LoRA adapters loaded and merged successfully")
+            # Store base model state for dynamic loading
+            self.base_gpt_state = {k: v.clone() for k, v in self.gpt.named_parameters()}
         
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:
@@ -237,6 +239,46 @@ class IndexTTS2:
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
+        
+        # Store base model weights for dynamic LoRA loading
+        self.base_gpt_state = None
+
+    def load_lora(self, lora_path):
+        """
+        Dynamically load LoRA weights into the GPT model.
+        
+        Args:
+            lora_path: Path to LoRA checkpoint directory
+        """
+        if self.base_gpt_state is None:
+            print(">> Warning: Base model state not stored. Cannot dynamically load LoRA.")
+            return False
+            
+        print(f">> Dynamically loading LoRA adapters from: {lora_path}")
+        
+        # Restore base model weights
+        with torch.no_grad():
+            for name, param in self.gpt.named_parameters():
+                if name in self.base_gpt_state:
+                    param.copy_(self.base_gpt_state[name])
+        
+        # Load and merge LoRA weights
+        self.gpt = load_lora_checkpoint(
+            self.gpt,
+            lora_path,
+            merge_weights=True,
+            device=self.device
+        )
+        
+        # Move to device and set to eval mode
+        self.gpt = self.gpt.to(self.device)
+        if self.use_fp16:
+            self.gpt.eval().half()
+        else:
+            self.gpt.eval()
+            
+        print(">> LoRA adapters dynamically loaded and merged successfully")
+        return True
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
