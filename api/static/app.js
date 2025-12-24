@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
     loadSpeakers();
     loadModels();
     setupEventListeners();
+    setupDragAndDrop();
 });
 
 // ============= Initialization =============
@@ -107,6 +108,105 @@ function updateSliderDisplays() {
     });
 }
 
+// ============= Drag and Drop Setup =============
+
+function setupDragAndDrop() {
+    // Reference audio drag and drop (inference)
+    const referenceDropZone = document.querySelector('[data-drop-zone="reference"]');
+    const referenceInput = document.getElementById('referenceAudio');
+    
+    if (referenceDropZone) {
+        setupDropZone(referenceDropZone, referenceInput, handleReferenceAudioDrop);
+    }
+
+    // Training files drag and drop
+    const trainingDropZone = document.querySelector('[data-drop-zone="training"]');
+    const trainingInput = document.getElementById('trainingFiles');
+    
+    if (trainingDropZone) {
+        setupDropZone(trainingDropZone, trainingInput, handleTrainingFilesDrop);
+    }
+}
+
+function setupDropZone(dropZone, fileInput, dropHandler) {
+    // Prevent default drag behaviors
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropZone.addEventListener(eventName, preventDefaults, false);
+        document.body.addEventListener(eventName, preventDefaults, false);
+    });
+
+    // Highlight drop zone when item is dragged over it
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dropZone.addEventListener(eventName, () => {
+            dropZone.classList.add('drag-over');
+        }, false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+        dropZone.addEventListener(eventName, () => {
+            dropZone.classList.remove('drag-over');
+        }, false);
+    });
+
+    // Handle dropped files
+    dropZone.addEventListener('drop', (e) => {
+        const files = e.dataTransfer.files;
+        dropHandler(files, fileInput);
+    }, false);
+
+    // Click to browse
+    dropZone.addEventListener('click', () => {
+        fileInput.click();
+    });
+}
+
+function preventDefaults(e) {
+    e.preventDefault();
+    e.stopPropagation();
+}
+
+function handleReferenceAudioDrop(files, fileInput) {
+    if (files.length === 0) return;
+
+    // Only accept first audio file
+    const audioFile = Array.from(files).find(file => file.type.startsWith('audio/'));
+    
+    if (!audioFile) {
+        showNotification('Please drop an audio file', 'error');
+        return;
+    }
+
+    // Create a new FileList-like object
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(audioFile);
+    fileInput.files = dataTransfer.files;
+
+    // Update display
+    document.getElementById('referenceAudioName').textContent = audioFile.name;
+    showNotification(`Added: ${audioFile.name}`, 'success');
+}
+
+function handleTrainingFilesDrop(files, fileInput) {
+    if (files.length === 0) return;
+
+    // Filter for audio files only
+    const audioFiles = Array.from(files).filter(file => file.type.startsWith('audio/'));
+    
+    if (audioFiles.length === 0) {
+        showNotification('Please drop audio files', 'error');
+        return;
+    }
+
+    // Create a new FileList-like object
+    const dataTransfer = new DataTransfer();
+    audioFiles.forEach(file => dataTransfer.items.add(file));
+    fileInput.files = dataTransfer.files;
+
+    // Update display
+    updateFileList(dataTransfer.files);
+    showNotification(`Added ${audioFiles.length} audio file(s)`, 'success');
+}
+
 // ============= Event Listeners =============
 
 function setupEventListeners() {
@@ -143,6 +243,11 @@ function setupEventListeners() {
 
     // Download button
     document.getElementById('downloadBtn').addEventListener('click', downloadAudio);
+
+    const clearAudioBtn = document.getElementById('clearReferenceAudioBtn');
+    if (clearAudioBtn) {
+        clearAudioBtn.addEventListener('click', clearReferenceAudio);
+    }
 }
 
 // ============= API Calls =============
@@ -403,43 +508,30 @@ async function streamSpeech() {
     const speaker = document.getElementById('speakerSelect').value;
     const usePatterns = document.getElementById('usePatternsCheckbox').checked;
 
-    if (!text) {
-        showNotification('Please enter text to synthesize', 'error');
-        return;
-    }
-
-    if (!audioFile && !speaker) {
-        showNotification('Please upload reference audio or select a speaker', 'error');
-        return;
-    }
-
-    if (usePatterns && !speaker) {
-        showNotification('Pattern embeddings require a trained speaker', 'error');
-        return;
-    }
-
-    if (!usePatterns && !audioFile) {
-        showNotification('Please upload reference audio when not using patterns', 'error');
-        return;
-    }
+    // --- Validation ---
+    if (!text) { showNotification('Please enter text to synthesize', 'error'); return; }
+    if (!audioFile && !speaker) { showNotification('Please upload reference audio or select a speaker', 'error'); return; }
+    if (usePatterns && !speaker) { showNotification('Pattern embeddings require a trained speaker', 'error'); return; }
+    if (!usePatterns && !audioFile) { showNotification('Please upload reference audio when not using patterns', 'error'); return; }
 
     const streamBtn = document.getElementById('streamBtn');
     streamBtn.disabled = true;
     streamBtn.textContent = 'Streaming...';
-
-    showProgress('Streaming speech...', 0);
+    showProgress('Initializing stream...', 0);
 
     try {
-        // Initialize Web Audio API
         if (!audioContext) {
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
         }
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
 
         const formData = new FormData();
-        
-        if (audioFile) {
-            formData.append('audio_file', audioFile);
-        }
+        if (audioFile) formData.append('audio_file', audioFile);
+
+        // Check if we have any emotion values set
+        const hasEmotionVector = emotionVector.some(v => v > 0);
 
         const requestData = {
             text: text,
@@ -447,9 +539,12 @@ async function streamSpeech() {
             use_patterns: usePatterns,
             temperature: parseFloat(document.getElementById('temperature').value),
             top_p: parseFloat(document.getElementById('topP').value),
-            top_k: parseInt(document.getElementById('topK').value)
+            top_k: parseInt(document.getElementById('topK').value),
+            emo_vector: hasEmotionVector ? emotionVector : null,
+            use_emo_text: document.getElementById('useEmoText').checked,
+            emo_text: document.getElementById('emotionText').value || null
         };
-
+        
         formData.append('request_json', JSON.stringify(requestData));
 
         const response = await fetch(`${API_BASE}/inference/stream`, {
@@ -457,89 +552,73 @@ async function streamSpeech() {
             body: formData
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(errorText || 'Streaming failed');
-        }
+        if (!response.ok) throw new Error(await response.text() || 'Streaming failed');
 
-        // Read and combine WAV chunks as they arrive
         const reader = response.body.getReader();
-        const chunks = [];
-        let receivedLength = 0;
+        
+        let nextStartTime = audioContext.currentTime;
         let chunkCount = 0;
+        let isFirstChunk = true;
+        let sampleRate = 24000; 
+        let channels = 1;
+        let leftoverChunk = new Uint8Array(0);
 
-        console.log('Starting to receive audio chunks...');
+        console.log('Stream connection established. Playing...');
 
         while (true) {
             const { done, value } = await reader.read();
-            
-            if (done) {
-                console.log(`Stream complete. Received ${chunkCount} chunks, ${receivedLength} bytes total`);
-                break;
-            }
-            
-            chunks.push(value);
-            receivedLength += value.length;
-            chunkCount++;
-            
-            const progressPercent = Math.min(90, 30 + chunkCount * 10); // Progressive increase
-            showProgress(`Streaming chunk ${chunkCount}... ${(receivedLength / 1024).toFixed(1)} KB`, progressPercent);
-            console.log(`Received chunk ${chunkCount}: ${value.length} bytes`);
-        }
+            if (done) break;
 
-        // Extract audio data from WAV chunks (skip headers except first)
-        console.log('Combining audio chunks...');
-        const audioDataChunks = [];
-        let totalAudioData = 0;
-        
-        for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            if (i === 0) {
-                // First chunk: keep entire WAV file including header
-                audioDataChunks.push(chunk);
-                totalAudioData += chunk.length;
-            } else {
-                // Subsequent chunks: skip 44-byte WAV header, just get audio data
-                const headerSize = 44;
-                if (chunk.length > headerSize) {
-                    const audioOnly = chunk.slice(headerSize);
-                    audioDataChunks.push(audioOnly);
-                    totalAudioData += audioOnly.length;
+            const combinedData = new Uint8Array(leftoverChunk.length + value.length);
+            combinedData.set(leftoverChunk);
+            combinedData.set(value, leftoverChunk.length);
+
+            let processData = combinedData;
+
+            if (isFirstChunk) {
+                if (combinedData.length >= 44) {
+                    const view = new DataView(combinedData.buffer, combinedData.byteOffset, combinedData.byteLength);
+                    channels = view.getUint16(22, true);
+                    sampleRate = view.getUint32(24, true);
+                    processData = combinedData.slice(44);
+                    isFirstChunk = false;
+                } else {
+                    leftoverChunk = combinedData;
+                    continue; 
                 }
             }
-        }
-        
-        // Combine into single array
-        const combinedAudio = new Uint8Array(totalAudioData);
-        let position = 0;
-        for (const chunk of audioDataChunks) {
-            combinedAudio.set(chunk, position);
-            position += chunk.length;
-        }
-        
-        // Update WAV header with correct size
-        const view = new DataView(combinedAudio.buffer);
-        // Update ChunkSize (file size - 8)
-        view.setUint32(4, combinedAudio.length - 8, true);
-        // Update Subchunk2Size (data size)
-        view.setUint32(40, combinedAudio.length - 44, true);
 
-        // Create blob and play
-        const audioBlob = new Blob([combinedAudio], { type: 'audio/wav' });
-        const audioUrl = URL.createObjectURL(audioBlob);
+            const remainder = processData.length % 2;
+            if (remainder !== 0) {
+                leftoverChunk = processData.slice(processData.length - 1);
+                processData = processData.slice(0, processData.length - 1);
+            } else {
+                leftoverChunk = new Uint8Array(0);
+            }
 
-        if (currentAudioUrl) {
-            URL.revokeObjectURL(currentAudioUrl);
+            if (processData.length > 0) {
+                const audioFloat32 = convertInt16ToFloat32(processData);
+                const audioBuffer = audioContext.createBuffer(channels, audioFloat32.length, sampleRate);
+                audioBuffer.getChannelData(0).set(audioFloat32);
+
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+
+                if (nextStartTime < audioContext.currentTime) {
+                    nextStartTime = audioContext.currentTime + 0.05;
+                }
+
+                source.start(nextStartTime);
+                nextStartTime += audioBuffer.duration;
+
+                chunkCount++;
+                showProgress(`Streaming... Chunk ${chunkCount}`, 50);
+            }
         }
-        currentAudioUrl = audioUrl;
 
-        const audioPlayer = document.getElementById('audioPlayer');
-        audioPlayer.src = audioUrl;
-        audioPlayer.play();
-        
-        document.getElementById('audioOutput').style.display = 'block';
         hideProgress();
-        showNotification('Speech streamed successfully!', 'success');
+        showNotification('Stream finished', 'success');
 
     } catch (error) {
         console.error('Streaming failed:', error);
@@ -549,6 +628,21 @@ async function streamSpeech() {
         streamBtn.disabled = false;
         streamBtn.innerHTML = '<span class="btn-icon">🎙️</span> Stream Speech';
     }
+}
+
+function convertInt16ToFloat32(inputArray) {
+    // Determine the length of the float32 array
+    // Int16 uses 2 bytes per sample, so length is half
+    const output = new Float32Array(inputArray.length / 2);
+    const view = new DataView(inputArray.buffer, inputArray.byteOffset, inputArray.byteLength);
+    
+    for (let i = 0; i < output.length; i++) {
+        // Convert PCM 16-bit Int to Float32 (-1.0 to 1.0)
+        // Little Endian is standard for WAV
+        const int16 = view.getInt16(i * 2, true);
+        output[i] = int16 / 32768; 
+    }
+    return output;
 }
 
 function downloadAudio() {
@@ -595,6 +689,22 @@ function updateFileList(files) {
             </div>
         `).join('')}
     `;
+}
+
+function clearReferenceAudio() {
+    const fileInput = document.getElementById('referenceAudio');
+    const fileNameDisplay = document.getElementById('referenceAudioName');
+    
+    // Reset the input value
+    fileInput.value = '';
+    
+    // Update the UI text
+    fileNameDisplay.textContent = 'No file selected';
+    
+    // Optional: Hide the audio output if it was related to this file
+    // document.getElementById('audioOutput').style.display = 'none';
+    
+    showNotification('Reference audio removed', 'info');
 }
 
 async function startTraining() {
@@ -717,6 +827,7 @@ async function loadTrainingTasks() {
         console.error('Failed to load training tasks:', error);
     }
 }
+
 
 // ============= UI Helpers =============
 

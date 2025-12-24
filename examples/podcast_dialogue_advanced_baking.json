@@ -1,0 +1,450 @@
+[
+  {
+    "speaker": "goldblum",
+    "text": "Alright owen, today we're making chocolate balls!",
+    "use_emo_text": true,
+    "emo_text": "excited and optimistic",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "goldblum",
+    "text": "They're these beautiful little truffle-like confections, very... sophisticated.",
+    "use_emo_text": true,
+    "emo_text": "enthusiastic and proud",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "Sounds brilliant! I'm ready, mate!",
+    "use_emo_text": true,
+    "emo_text": "eager and cooperative",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Perfect! So first, we need to melt the chocolate. Very gently.",
+    "use_emo_text": true,
+    "emo_text": "instructive and focused",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "We'll use a double boiler. Do you know what that is?",
+    "use_emo_text": true,
+    "emo_text": "slightly condescending but trying to be helpful",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "owen",
+    "text": "Uh... not really? Can't we just zap it in the microwave?",
+    "use_emo_text": true,
+    "emo_text": "confused and suggesting alternatives",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "goldblum",
+    "text": "No! No, no, no. That'll ruin it completely.",
+    "use_emo_text": true,
+    "emo_text": "alarmed and protective",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "We need... controlled, gentle heat. Like a warm embrace for the chocolate.",
+    "use_emo_text": true,
+    "emo_text": "poetic and overly dramatic",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "owen",
+    "text": "A warm embrace. Right.",
+    "use_emo_text": true,
+    "emo_text": "slightly amused but going along with it",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "owen",
+    "text": "So I just put a bowl over a pot of water?",
+    "use_emo_text": true,
+    "emo_text": "trying to understand",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Exactly! You're getting it!",
+    "use_emo_text": true,
+    "emo_text": "pleased and encouraging",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "Alright, water's heating up. Now what?",
+    "use_emo_text": true,
+    "emo_text": "focused and ready",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Now you stir. Constantly. Don't stop stirring.",
+    "use_emo_text": true,
+    "emo_text": "serious and instructive",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "owen",
+    "text": "Like this?",
+    "use_emo_text": true,
+    "emo_text": "seeking approval",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Yes! Perfect! Keep that motion, nice and... wait, is it getting lumpy?",
+    "use_emo_text": true,
+    "emo_text": "encouraging then suddenly concerned",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "Lumpy? I don't know, you tell me!",
+    "use_emo_text": true,
+    "emo_text": "worried and defensive",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "owen",
+    "text": "It looks a bit... clumpy? Maybe?",
+    "use_emo_text": true,
+    "emo_text": "uncertain and nervous",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Oh no. No, no, no.",
+    "use_emo_text": true,
+    "emo_text": "panic setting in",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Stir faster! More vigorously!",
+    "use_emo_text": true,
+    "emo_text": "urgent and stressed",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "I AM stirring! My bloody arm is about to fall off!",
+    "use_emo_text": true,
+    "emo_text": "frustrated and physically tired",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Well you can't stop now! Here, let me add the cream.",
+    "use_emo_text": true,
+    "emo_text": "tense and taking control",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Hand me that measuring cup. The one right there.",
+    "use_emo_text": true,
+    "emo_text": "demanding and impatient",
+    "emotion_alpha": 0.3
+  },
+  {
+    "speaker": "owen",
+    "text": "Which one? This one?",
+    "use_emo_text": true,
+    "emo_text": "confused while trying to stir",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "Oh bugger, I'm spilling the chocolate!",
+    "use_emo_text": true,
+    "emo_text": "panicked and clumsy",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "goldblum",
+    "text": "owen!",
+    "use_emo_text": true,
+    "emo_text": "exasperated and sharp",
+    "emotion_alpha": 0.8
+  },
+  {
+    "speaker": "owen",
+    "text": "You asked me to hand you something while I'm stirring!",
+    "use_emo_text": true,
+    "emo_text": "defensive and angry",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "I've only got two hands, mate!",
+    "use_emo_text": true,
+    "emo_text": "irritated and justified",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Okay. Okay, it's fine.",
+    "use_emo_text": true,
+    "emo_text": "trying to calm down",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "We'll just... work with what we have. It'll be fine.",
+    "use_emo_text": true,
+    "emo_text": "unconvincing and worried",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "It looks really runny, Jeff.",
+    "use_emo_text": true,
+    "emo_text": "concerned and doubtful",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "That's... that's probably normal. Maybe.",
+    "use_emo_text": true,
+    "emo_text": "uncertain and losing confidence",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Let's add the butter. That should help thicken it.",
+    "use_emo_text": true,
+    "emo_text": "grasping at solutions",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "How much butter?",
+    "use_emo_text": true,
+    "emo_text": "wanting clear instructions",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Uh... all of it? Let's just use all of it.",
+    "use_emo_text": true,
+    "emo_text": "improvising desperately",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "You sure about that?",
+    "use_emo_text": true,
+    "emo_text": "skeptical and losing trust",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Yes! No. Maybe. Just... put it in.",
+    "use_emo_text": true,
+    "emo_text": "flustered and indecisive",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "This is madness.",
+    "use_emo_text": true,
+    "emo_text": "resigned and frustrated",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "goldblum",
+    "text": "It's not madness, it's... creative adaptation!",
+    "use_emo_text": true,
+    "emo_text": "defensive and making excuses",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "Right. Now what?",
+    "use_emo_text": true,
+    "emo_text": "tired and skeptical",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "We refrigerate it. For... a while.",
+    "use_emo_text": true,
+    "emo_text": "vague and avoiding details",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Maybe two hours? Until it firms up.",
+    "use_emo_text": true,
+    "emo_text": "uncertain and hoping for the best",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "owen",
+    "text": "Maybe? You don't actually know, do you?",
+    "use_emo_text": true,
+    "emo_text": "accusatory and losing patience",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "goldblum",
+    "text": "I... look, we changed the ratios when you spilled, so I'm improvising here!",
+    "use_emo_text": true,
+    "emo_text": "defensive and irritated",
+    "emotion_alpha": 0.8
+  },
+  {
+    "speaker": "owen",
+    "text": "Oh, so this is MY fault now?",
+    "use_emo_text": true,
+    "emo_text": "offended and angry",
+    "emotion_alpha": 0.8
+  },
+  {
+    "speaker": "goldblum",
+    "text": "I didn't say that!",
+    "use_emo_text": true,
+    "emo_text": "frustrated and argumentative",
+    "emotion_alpha": 0.8
+  },
+  {
+    "speaker": "owen",
+    "text": "You literally just said 'when YOU spilled'!",
+    "use_emo_text": true,
+    "emo_text": "confrontational and bitter",
+    "emotion_alpha": 0.8
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Let's just... put it in the fridge. Please.",
+    "use_emo_text": true,
+    "emo_text": "exhausted and wanting to end the argument",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "Fine.",
+    "use_emo_text": true,
+    "emo_text": "terse and still annoyed",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "I'm getting a drink.",
+    "use_emo_text": true,
+    "emo_text": "done with the situation",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Two hours later... Okay! Let's see how our chocolate balls turned out!",
+    "use_emo_text": true,
+    "emo_text": "nervously optimistic",
+    "emotion_alpha": 0.6
+  },
+  {
+    "speaker": "owen",
+    "text": "Jeff...",
+    "use_emo_text": true,
+    "emo_text": "ominous and disappointed",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "What? What is it?",
+    "use_emo_text": true,
+    "emo_text": "anxious and dreading the answer",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "It's still liquid. Completely liquid.",
+    "use_emo_text": true,
+    "emo_text": "resigned and unsurprised",
+    "emotion_alpha": 0.5
+  },
+  {
+    "speaker": "goldblum",
+    "text": "No. No, that's... that's impossible.",
+    "use_emo_text": true,
+    "emo_text": "in denial and devastated",
+    "emotion_alpha": 0.8
+  },
+  {
+    "speaker": "goldblum",
+    "text": "We followed the... well, we mostly followed...",
+    "use_emo_text": true,
+    "emo_text": "realizing the truth",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "goldblum",
+    "text": "This is chocolate soup.",
+    "use_emo_text": true,
+    "emo_text": "defeated and embarrassed",
+    "emotion_alpha": 0.7
+  },
+  {
+    "speaker": "owen",
+    "text": "Well...",
+    "use_emo_text": true,
+    "emo_text": "trying to find a positive",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "owen",
+    "text": "It tastes good at least. Here, have a spoon.",
+    "use_emo_text": true,
+    "emo_text": "finding humor in the disaster",
+    "emotion_alpha": 0.3
+  },
+  {
+    "speaker": "goldblum",
+    "text": "I suppose... chocolate soup isn't the worst thing.",
+    "use_emo_text": true,
+    "emo_text": "reluctantly accepting defeat",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Though it's certainly not what I had envisioned.",
+    "use_emo_text": true,
+    "emo_text": "disappointed but calming down",
+    "emotion_alpha": 0.4
+  },
+  {
+    "speaker": "owen",
+    "text": "Next time, mate...",
+    "use_emo_text": true,
+    "emo_text": "gentle and reconciliatory",
+    "emotion_alpha": 0.3
+  },
+  {
+    "speaker": "owen",
+    "text": "Maybe we stick to something simpler. Like toast.",
+    "use_emo_text": true,
+    "emo_text": "amused and friendly again",
+    "emotion_alpha": 0.3
+  },
+  {
+    "speaker": "goldblum",
+    "text": "Toast. Yes.",
+    "use_emo_text": true,
+    "emo_text": "humbled and agreeing",
+    "emotion_alpha": 0.3
+  },
+  {
+    "speaker": "goldblum",
+    "text": "I think that's probably... very wise.",
+    "use_emo_text": true,
+    "emo_text": "warmly accepting the suggestion",
+    "emotion_alpha": 0.3
+  }
+]

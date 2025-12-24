@@ -1,0 +1,72 @@
+[
+    {
+      "speaker": "goldblum",
+      "text": "Welcome everyone to our philosophical exploration of consciousness and existence!",
+      "use_emo_text": true,
+      "temperature": 0.9,
+      "emotion_alpha": 0.8
+    },
+    {
+      "speaker": "owen",
+      "text": "Yeah! Let's dive into the madness, shall we?",
+      "emotion_vector": [0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0],
+      "pattern_scale": 0.025,
+      "temperature": 0.85
+    },
+    {
+      "speaker": "goldblum",
+      "text": "You know, the concept of time has always... fascinated me. It's not linear, not really.",
+      "use_emo_text": true,
+      "emo_text": "curious and contemplative",
+      "temperature": 0.88
+    },
+    {
+      "speaker": "owen",
+      "text": "Time? Mate, after decades on tour, time just... blurs together!",
+      "emotion_vector": [0.2, 0.0, 0.1, 0.0, 0.0, 0.4, 0.1, 0.0],
+      "top_p": 0.85,
+      "top_k": 35
+    },
+    {
+      "speaker": "goldblum",
+      "text": "But that's the beauty of it! The subjective nature, the way it bends and warps around experience.",
+      "use_emo_text": true,
+      "temperature": 0.92,
+      "pattern_scale": 0.03
+    },
+    {
+      "speaker": "owen",
+      "text": "I'll tell you what warps time - a good riff and a sold-out crowd! That's when everything just stops.",
+      "emotion_vector": [0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "emotion_alpha": 0.9,
+      "temperature": 0.82
+    },
+    {
+      "speaker": "goldblum",
+      "text": "Exactly! Flow state, peak experience... we're talking about the same phenomenon from different angles.",
+      "use_emo_text": true,
+      "emo_text": "excited and engaged in discussion",
+      "top_k": 25
+    },
+    {
+      "speaker": "owen",
+      "text": "Maybe we're all just reflections in some cosmic mirror, you know?",
+      "emotion_vector": [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.2, 0.0],
+      "temperature": 0.75,
+      "pattern_scale": 0.015
+    },
+    {
+      "speaker": "goldblum",
+      "text": "I couldn't have said it better myself. The universe experiencing itself through us.",
+      "use_emo_text": true,
+      "temperature": 0.85,
+      "emotion_alpha": 1.0
+    },
+    {
+      "speaker": "owen",
+      "text": "Cheers to that, mate! Now that's something worth pondering over a pint!",
+      "emotion_vector": [0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1],
+      "temperature": 0.88,
+      "top_p": 0.85
+    }
+  ]

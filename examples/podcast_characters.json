@@ -1,0 +1,26 @@
+{
+  "goldblum": {
+    "pattern_embedding_path": "training/goldblum/pattern_training/final_checkpoint/pattern_embedding.pt",
+    "lora_path": "training/goldblum/pattern_training/final_checkpoint/lora",
+    "speaker_embeddings_path": "training/goldblum/embeddings/speaker_embeddings.pt",
+    "pattern_scale": 0.6,
+    "temperature": 0.85,
+    "top_p": 0.8,
+    "top_k": 30,
+    "emotion_alpha": 1.0,
+    "use_emo_text": false,
+    "injection_mode": "add"
+  },
+  "owen": {
+    "pattern_embedding_path": "training/owen/pattern_training/final_checkpoint/pattern_embedding.pt",
+    "lora_path": "training/owen/pattern_training/final_checkpoint/lora",
+    "speaker_embeddings_path": "training/owen/embeddings/speaker_embeddings.pt",
+    "pattern_scale": 0.9,
+    "temperature": 0.8,
+    "top_p": 0.8,
+    "top_k": 30,
+    "emotion_alpha": 1.0,
+    "use_emo_text": false,
+    "injection_mode": "add"
+  }
+}

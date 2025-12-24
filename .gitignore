@@ -30,3 +30,5 @@ desktop.ini
 !/checkpoints/*.yaml
 /outputs/
 training
+output
+CrisperWhisper

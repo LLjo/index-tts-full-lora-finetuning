@@ -63,11 +63,14 @@
 
                     <div class="form-row">
                         <div class="form-group">
-                            <label for="referenceAudio">Speaker Reference Audio</label>
-                            <div class="file-upload">
-                                <input type="file" id="referenceAudio" accept="audio/*">
-                                <span class="file-name" id="referenceAudioName">No file selected</span>
+                            <div class="file-input-wrapper" data-drop-zone="reference">
+                                <label for="referenceAudio">Speaker Reference Audio</label>
+                                <div class="file-upload">
+                                    <input type="file" id="referenceAudio" accept="audio/*">
+                                    <span class="file-name" id="referenceAudioName">No file selected</span>
+                                </div>
                             </div>
+                            <button type="button" id="clearReferenceAudioBtn" class="btn btn-secondary">Remove File</button>
                         </div>
                         
                         <div class="form-group">
@@ -196,9 +199,11 @@
 
                     <div class="form-group">
                         <label for="trainingFiles">Training Audio Files (minimum 5)</label>
-                        <div class="file-upload">
-                            <input type="file" id="trainingFiles" accept="audio/*" multiple>
-                            <span class="file-name" id="trainingFilesName">No files selected</span>
+                        <div class="file-input-wrapper" data-drop-zone="training">
+                            <div class="file-upload">
+                                <input type="file" id="trainingFiles" accept="audio/*" multiple>
+                                <span class="file-name" id="trainingFilesName">No files selected</span>
+                            </div>
                         </div>
                         <small>Upload WAV, MP3, or FLAC files of the speaker</small>
                     </div>
