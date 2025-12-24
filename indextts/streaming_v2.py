@@ -306,7 +306,10 @@ class ProgressiveMelSynthesizer:
                     self.previous_mel_context = cond.clone()
                 
                 # BigVGAN vocoding
-                wav = self.tts.bigvgan(vc_target.float()).squeeze()
+                with torch.cuda.amp.autocast(enabled=False):
+                    # Ensure the input is float32 and on the correct device
+                    vc_target_f32 = vc_target.to(device=device, dtype=torch.float32)
+                    wav = self.tts.bigvgan(vc_target_f32).squeeze()
         
         # Convert to proper format
         wav = torch.clamp(32767 * wav, -32767.0, 32767.0).cpu()
@@ -534,7 +537,10 @@ class EnhancedProgressiveSynthesizer(ProgressiveMelSynthesizer):
                     vc_target = vc_target[:, :, self.ref_mel.size(-1):]
                 
                 # Vocoding
-                wav = self.tts.bigvgan(vc_target.float()).squeeze()
+                with torch.cuda.amp.autocast(enabled=False):
+                    # Ensure the input is float32 and on the correct device
+                    vc_target_f32 = vc_target.to(device=device, dtype=torch.float32)
+                    wav = self.tts.bigvgan(vc_target_f32).squeeze()
         
         # Audio processing
         wav = torch.clamp(32767 * wav, -32767.0, 32767.0).cpu()
