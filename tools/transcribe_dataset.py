@@ -41,6 +41,12 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import os
+import sys
+import torch
+
+
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -108,96 +114,119 @@ class WhisperTranscriber:
         """Load Whisper model."""
         if self.use_faster_whisper:
             try:
-                from faster_whisper import WhisperModel
-                
-                device = self.device
-                if device == "auto":
-                    import torch
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                
-                compute_type = self.compute_type
-                if compute_type == "auto":
-                    compute_type = "float16" if device == "cuda" else "int8"
-                
-                print(f"Loading faster-whisper model: {self.model_name} on {device}")
-                self.model = WhisperModel(
-                    self.model_name,
-                    device=device,
-                    compute_type=compute_type,
+                import nemo.collections.asr as nemo_asr
+                self.model = nemo_asr.models.ASRModel.from_pretrained(
+                    model_name="nvidia/parakeet-tdt-0.6b-v3"
                 )
-                self._transcribe_fn = self._transcribe_faster_whisper
-                print(f"✓ faster-whisper loaded successfully")
+                self._transcribe_fn = self._transcribe_nemo
+                print('✓ NeMo Parakeet loaded successfully')
                 return
-            except ImportError:
-                print("faster-whisper not installed, trying openai-whisper...")
+                
+            except Exception as e:
+                print(f"Failed to load NeMo Parakeet: {e}")
+                import traceback
+                traceback.print_exc()
+
+
+    
+    def _transcribe_nemo(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+    ) -> Tuple[str, List[WordTiming], str]:
+        """Transcribe using NVIDIA Parakeet."""
+        import tempfile
+        import soundfile as sf
+        import numpy as np
+        import torch
         
-        # Fallback to openai-whisper
         try:
-            import whisper
-            print(f"Loading openai-whisper model: {self.model_name}")
-            self.model = whisper.load_model(self.model_name)
-            self._transcribe_fn = self._transcribe_openai_whisper
-            print(f"✓ openai-whisper loaded successfully")
-        except ImportError:
-            raise ImportError(
-                "No Whisper implementation found!\n"
-                "Install one of:\n"
-                "  pip install openai-whisper\n"
-                "  pip install faster-whisper  (recommended for speed)"
-            )
-    
-    def _transcribe_faster_whisper(
-        self,
-        audio_path: str,
-        language: Optional[str] = None,
-    ) -> Tuple[str, List[WordTiming], str]:
-        """Transcribe using faster-whisper."""
-        segments, info = self.model.transcribe(
-            audio_path,
-            language=language,
-            word_timestamps=True,
-            vad_filter=True,  # Filter out non-speech
-        )
+            # Load and prepare audio
+            audio, sample_rate = sf.read(audio_path)
+            
+            # Convert stereo to mono if necessary
+            if len(audio.shape) > 1 and audio.shape[1] > 1:
+                audio = np.mean(audio, axis=1)
+            
+            # Ensure correct sample rate (16kHz for Parakeet)
+            expected_sr = 16000
+            if sample_rate != expected_sr:
+                # Resample if needed
+                import librosa
+                audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=expected_sr)
+                sample_rate = expected_sr
+            
+            # Create temporary mono audio file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                sf.write(tmp_path, audio, sample_rate)
+            
+            try:
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Transcribe with timestamps - use batch_size=1
+                results = self.model.transcribe(
+                    [tmp_path],
+                    batch_size=1,
+                    timestamps=True,
+                    return_hypotheses=True,
+                )
+                
+                # Extract results
+                if not results or len(results) == 0:
+                    print(f"Warning: No results for {audio_path}")
+                    return "", [], "en"
+                
+                # Get first hypothesis
+                hyp = results[0]
+                if isinstance(hyp, list):
+                    if len(hyp) == 0:
+                        return "", [], "en"
+                    hyp = hyp[0]
+                
+                # Extract text
+                full_text = getattr(hyp, 'text', '')
+                if not full_text:
+                    return "", [], "en"
+                
+                # Extract word timestamps
+                words = []
+                ts_data = getattr(hyp, 'timestep', None) or getattr(hyp, 'timestamp', None)
+                
+                if ts_data and isinstance(ts_data, dict) and 'word' in ts_data:
+                    for word_info in ts_data['word']:
+                        try:
+                            word_text = word_info.get('word', '').strip()
+                            if word_text:  # Skip empty words
+                                words.append(WordTiming(
+                                    word=word_text,
+                                    start=float(word_info.get('start', 0)),
+                                    end=float(word_info.get('end', 0)),
+                                    probability=1.0,
+                                ))
+                        except (KeyError, ValueError, TypeError) as e:
+                            continue
+                
+                return full_text.strip(), words, "en"
+            
+            finally:
+                # Cleanup
+                import os
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except:
+                    pass
+                
+                # Clear CUDA cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
-        words = []
-        full_text_parts = []
-        
-        for segment in segments:
-            full_text_parts.append(segment.text)
-            if segment.words:
-                for word in segment.words:
-                    words.append(WordTiming(
-                        word=word.word.strip(),
-                        start=word.start,
-                        end=word.end,
-                        probability=word.probability,
-                    ))
-        
-        return " ".join(full_text_parts).strip(), words, info.language
-    
-    def _transcribe_openai_whisper(
-        self,
-        audio_path: str,
-        language: Optional[str] = None,
-    ) -> Tuple[str, List[WordTiming], str]:
-        """Transcribe using openai-whisper."""
-        result = self.model.transcribe(
-            audio_path,
-            language=language,
-            word_timestamps=True,
-        )
-        
-        words = []
-        for segment in result.get("segments", []):
-            for word_info in segment.get("words", []):
-                words.append(WordTiming(
-                    word=word_info["word"].strip(),
-                    start=word_info["start"],
-                    end=word_info["end"],
-                    probability=word_info.get("probability", 1.0),
-                ))
-        
-        return result["text"].strip(), words, result.get("language", "")
+        except Exception as e:
+            print(f"Error transcribing {audio_path}: {type(e).__name__}: {str(e)[:100]}")
+            return "", [], "en"
     
     def transcribe(
         self,
@@ -222,7 +251,6 @@ class WhisperTranscriber:
         """
         # Get transcription with word timestamps
         text, words, detected_language = self._transcribe_fn(audio_path, language)
-        
         if not words:
             # No word timestamps available
             return TranscriptionResult(
@@ -438,7 +466,7 @@ Examples:
     print("=" * 60)
     print(f"\nAudio directory: {audio_dir}")
     print(f"Found {len(audio_files)} audio files")
-    print(f"Whisper model: {args.whisper_model}")
+    print(f"Transcribe model: {args.whisper_model}")
     print(f"Language: {args.language or 'auto-detect'}")
     print()
     
@@ -450,11 +478,11 @@ Examples:
         return
     
     # Initialize transcriber
-    print("Loading Whisper model...")
+    print("Loading transcribe model...")
     transcriber = WhisperTranscriber(
         model_name=args.whisper_model,
         device=args.device,
-        use_faster_whisper=not args.no_faster_whisper,
+        use_faster_whisper=True,
     )
     
     # Transcribe all files
