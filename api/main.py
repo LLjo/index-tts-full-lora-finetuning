@@ -29,7 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from indextts.infer_v2 import IndexTTS2
 from indextts.pattern_embeddings import PatternEmbedding
-from indextts.streaming import streaming_inference, StreamingConfig
+from indextts.streaming_v2 import streaming_inference_v2, StreamingConfigV2
 from tools.infer_with_patterns import pattern_aware_inference, pattern_aware_inference_streaming
 
 # Global state
@@ -435,15 +435,15 @@ async def stream_speech(
                         return
             
             # Configure streaming for optimal TTFA
-            config = StreamingConfig(
-                min_chunk_tokens=request.min_chunk_tokens,
-                chunk_tokens=request.chunk_tokens,
-                diffusion_steps=request.diffusion_steps,
-                first_chunk_diffusion_steps=request.first_chunk_diffusion_steps,
-                inference_cfg_rate=0.7,
-                synthesize_during_generation=True,
-                verbose=False,
-            )
+            # config = StreamingConfig(
+            #     min_chunk_tokens=request.min_chunk_tokens,
+            #     chunk_tokens=request.chunk_tokens,
+            #     diffusion_steps=request.diffusion_steps,
+            #     first_chunk_diffusion_steps=request.first_chunk_diffusion_steps,
+            #     inference_cfg_rate=0.7,
+            #     synthesize_during_generation=True,
+            #     verbose=False,
+            # )
             
             # Stream using optimized streaming module with pattern embedding support
             chunk_idx = 0
@@ -500,87 +500,6 @@ async def stream_speech(
     return StreamingResponse(generate_chunks(), media_type="audio/wav")
 
 
-@app.post("/inference/stream/fast")
-async def stream_speech_fast(
-    audio_file: UploadFile = File(..., description="Speaker reference audio"),
-    text: str = Form(..., description="Text to synthesize"),
-    min_chunk_tokens: int = Form(15, description="Tokens for first chunk"),
-    chunk_tokens: int = Form(50, description="Tokens per chunk"),
-    diffusion_steps: int = Form(12, description="Diffusion steps"),
-    first_chunk_diffusion_steps: int = Form(6, description="Diffusion steps for first chunk"),
-    temperature: float = Form(0.8),
-    top_p: float = Form(0.8),
-    top_k: int = Form(30),
-):
-    """
-    Fast streaming endpoint with simple form inputs for quick testing.
-    
-    This is a simplified endpoint that takes form parameters directly
-    instead of JSON, making it easier to test with tools like curl.
-    
-    Example:
-        curl -X POST http://localhost:8000/inference/stream/fast \
-            -F "audio_file=@speaker.wav" \
-            -F "text=Hello world" \
-            --output output.wav
-    """
-    if tts_model is None:
-        raise HTTPException(status_code=503, detail="TTS model not loaded")
-    
-    # Save uploaded audio
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_audio:
-        shutil.copyfileobj(audio_file.file, tmp_audio)
-        tmp_audio_path = tmp_audio.name
-    
-    async def generate():
-        import io
-        import wave
-        
-        try:
-            config = StreamingConfig(
-                min_chunk_tokens=min_chunk_tokens,
-                chunk_tokens=chunk_tokens,
-                diffusion_steps=diffusion_steps,
-                first_chunk_diffusion_steps=first_chunk_diffusion_steps,
-                synthesize_during_generation=True,
-            )
-            
-            header_sent = False
-            for wav_chunk in streaming_inference(
-                tts=tts_model,
-                text=text,
-                audio_prompt=tmp_audio_path,
-                config=config,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            ):
-                if wav_chunk.dim() == 1:
-                    wav_chunk = wav_chunk.unsqueeze(0)
-                
-                chunk_int16 = wav_chunk.type(torch.int16)
-                
-                if not header_sent:
-                    wav_io = io.BytesIO()
-                    with wave.open(wav_io, 'wb') as wav_file:
-                        wav_file.setnchannels(1)
-                        wav_file.setsampwidth(2)
-                        wav_file.setframerate(22050)
-                        wav_file.writeframes(b'\x00\x00')
-                    wav_io.seek(0)
-                    yield wav_io.read(44)
-                    header_sent = True
-                
-                yield chunk_int16.cpu().numpy().tobytes()
-        finally:
-            try:
-                os.unlink(tmp_audio_path)
-            except:
-                pass
-    
-    return StreamingResponse(generate(), media_type="audio/wav")
-
-
 async def generate_with_patterns(
     speaker: str,
     text: str,
@@ -601,7 +520,9 @@ async def generate_with_patterns(
     
     # Load pattern embedding
     pattern_embedding = PatternEmbedding.load(pattern_path, device=tts_model.device)
-    
+    pattern_embedding.eval()
+    if hasattr(pattern_embedding, 'pattern_scale'):
+        original_scale = pattern_embedding.pattern_scale.item()
     # Load speaker embeddings if no audio prompt
     speaker_embeddings = None
     if audio_prompt is None:

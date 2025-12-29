@@ -1,39 +1,47 @@
 #!/usr/bin/env python3
 """
-Pattern Embedding Training for IndexTTS2
+Verbatim LoRA Training for IndexTTS2
 
-This is THE NEW approach to training speaking patterns (stutters, pauses, etc.)
-that ACTUALLY WORKS at inference time!
+Train LoRA adapters on verbatim transcriptions to reproduce stutters and 
+speech imperfections at inference time.
 
-THE KEY DIFFERENCE:
-==================
-Old approach: Train LoRA on codes, hope patterns emerge
-- Problem: Patterns tied to specific conditioning, don't transfer to inference
+The Key Insight:
+================
+Standard training: clean text → audio codes
+    Problem: Model learns clean speech, no stutters
 
-New approach: Train LEARNABLE PATTERN EMBEDDINGS
-- Pattern embedding is injected into GPT conditioning
-- Same embedding used in training AND inference
-- Patterns transfer because the "trigger" is preserved!
+Verbatim training: stuttered text → audio codes  
+    Solution: Model learns "I I I was" → stuttered audio codes
 
-How it works:
-1. PatternEmbedding: Learnable tokens that encode "speak with THIS person's patterns"
-2. Pattern-aware loss: Explicitly rewards pause/pattern reproduction
-3. Combined training: LoRA + PatternEmbedding trained together
+This means at inference:
+    - Input "I I I was going going to" → Output has stutters!
+    - Input "I was going to" → Output is clean
+
+The model learns the DIRECT TEXT-TO-STUTTER mapping!
+
+Architecture (IndexTTS2 v2.0):
+=============================
+Stage 1 (GPT) - WHAT WE TRAIN:
+    text_tokens + conditioning → semantic_codes
+    
+    We train LoRA on:
+    - GPT transformer layers (c_attn, c_proj, c_fc)
+    - Optionally: conditioning encoders, heads
+    
+Stage 2 (S2Mel + BigVGAN) - UNCHANGED:
+    semantic_codes + reference features → audio waveform
 
 Usage:
-    # Prepare dataset (extracts pattern features)
-    python tools/prepare_pattern_dataset.py --speaker ozzy
+    python tools/train_verbatim_lora.py --speaker ozzy --epochs 20
     
-    # Train pattern embedding + LoRA
-    python tools/train_pattern_embeddings.py \
-        --speaker ozzy \
-        --epochs 40 \
-        --pattern-tokens 8
-    
-    # Inference (patterns will appear!)
-    python tools/infer_with_patterns.py \
-        --speaker ozzy \
-        --text "Hello world"
+    # Advanced options
+    python tools/train_verbatim_lora.py \\
+        --speaker ozzy \\
+        --epochs 30 \\
+        --lora-rank 16 \\
+        --batch-size 4 \\
+        --learning-rate 5e-4 \\
+        --stutter-weight 2.0
 """
 
 from __future__ import annotations
@@ -41,13 +49,12 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
-import math
 import os
 import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -61,7 +68,6 @@ from transformers import get_cosine_schedule_with_warmup
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# Add project root
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -72,17 +78,11 @@ from indextts.utils.lora_utils import (
     save_lora_checkpoint,
     get_trainable_parameters,
 )
-from indextts.pattern_embeddings import (
-    PatternEmbedding,
-    PatternExtractor,
-    PatternAwareLoss,
-    PatternFeatures,
-)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train Pattern Embeddings for speaking pattern reproduction",
+        description="Train LoRA on verbatim transcriptions for stutter reproduction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -92,41 +92,35 @@ def parse_args():
     parser.add_argument("--train-manifest", type=Path, help="Custom train manifest")
     parser.add_argument("--val-manifest", type=Path, help="Custom val manifest")
     
-    # Pattern embedding
-    parser.add_argument("--pattern-tokens", type=int, default=8,
-                        help="Number of learnable pattern tokens (default: 8)")
-    parser.add_argument("--pattern-lr", type=float, default=1e-3,
-                        help="Learning rate for pattern embedding (default: 1e-3)")
-    parser.add_argument("--injection-mode", choices=["add", "prepend", "replace_first"],
-                        default="add", help="How to inject pattern embedding")
-    
-    # LoRA
-    parser.add_argument("--lora-rank", type=int, default=32,
-                        help="LoRA rank (default: 32)")
-    parser.add_argument("--lora-alpha", type=int, default=64,
-                        help="LoRA alpha (default: 64)")
+    # LoRA config
+    parser.add_argument("--lora-rank", type=int, default=16,
+                        help="LoRA rank (default: 16)")
+    parser.add_argument("--lora-alpha", type=int, default=32,
+                        help="LoRA alpha (default: 32)")
     parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--no-lora", action="store_true",
-                        help="Train only pattern embedding, no LoRA")
+    parser.add_argument("--include-conditioning", action="store_true", default=True,
+                        help="Apply LoRA to conditioning encoders")
+    parser.add_argument("--include-heads", action="store_true", default=False,
+                        help="Apply LoRA to output heads")
     
     # Training
-    parser.add_argument("--epochs", type=int, default=40,
-                        help="Training epochs (default: 40)")
+    parser.add_argument("--epochs", type=int, default=20,
+                        help="Training epochs (default: 20)")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Batch size (default: 4)")
     parser.add_argument("--grad-accumulation", type=int, default=4,
                         help="Gradient accumulation steps (default: 4)")
     parser.add_argument("--learning-rate", type=float, default=5e-4,
-                        help="Learning rate for LoRA (default: 5e-4)")
+                        help="Learning rate (default: 5e-4)")
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--amp", action="store_true", help="Use mixed precision")
     
     # Loss weights
-    parser.add_argument("--pause-weight", type=float, default=2.0,
-                        help="Weight for pause loss (default: 2.0)")
-    parser.add_argument("--rate-weight", type=float, default=0.5,
-                        help="Weight for rate loss (default: 0.5)")
+    parser.add_argument("--text-weight", type=float, default=0.2,
+                        help="Weight for text loss (default: 0.2)")
+    parser.add_argument("--stutter-weight", type=float, default=2.0,
+                        help="Extra weight for samples with stutters (default: 2.0)")
     
     # Output
     parser.add_argument("--output-dir", type=Path, help="Custom output directory")
@@ -151,7 +145,7 @@ def set_seed(seed: int):
 
 
 @dataclass
-class PatternSample:
+class VerbatimSample:
     id: str
     text_ids_path: Path
     codes_path: Path
@@ -160,17 +154,18 @@ class PatternSample:
     text_len: int
     code_len: int
     condition_len: int
-    # Pattern-specific
-    pattern_features_path: Optional[Path] = None
+    has_repetitions: bool = False
+    has_fillers: bool = False
+    repetition_count: int = 0
 
 
-class PatternDataset(Dataset):
-    """Dataset that loads pattern features alongside standard features."""
+class VerbatimDataset(Dataset):
+    """Dataset for verbatim training."""
     
     def __init__(self, manifest_path: Path):
         self.manifest_path = manifest_path
         self.base_dir = manifest_path.parent
-        self.samples: List[PatternSample] = []
+        self.samples: List[VerbatimSample] = []
         self._load_manifest()
     
     def _resolve_path(self, value: str) -> Path:
@@ -186,7 +181,7 @@ class PatternDataset(Dataset):
                     continue
                 record = json.loads(line)
                 
-                sample = PatternSample(
+                sample = VerbatimSample(
                     id=record["id"],
                     text_ids_path=self._resolve_path(record["text_ids_path"]),
                     codes_path=self._resolve_path(record["codes_path"]),
@@ -195,14 +190,17 @@ class PatternDataset(Dataset):
                     text_len=int(record["text_len"]),
                     code_len=int(record["code_len"]),
                     condition_len=int(record.get("condition_len", 32)),
-                    pattern_features_path=(
-                        self._resolve_path(record["pattern_features_path"])
-                        if "pattern_features_path" in record else None
-                    ),
+                    has_repetitions=record.get("has_repetitions", False),
+                    has_fillers=record.get("has_fillers", False),
+                    repetition_count=record.get("repetition_count", 0),
                 )
                 self.samples.append(sample)
         
         print(f"Loaded {len(self.samples)} samples from {self.manifest_path}")
+        
+        # Count stutter samples
+        stutter_count = sum(1 for s in self.samples if s.has_repetitions or s.has_fillers)
+        print(f"  Samples with stutters: {stutter_count}/{len(self.samples)}")
     
     def __len__(self):
         return len(self.samples)
@@ -215,12 +213,6 @@ class PatternDataset(Dataset):
         condition = np.load(sample.condition_path, allow_pickle=False).astype(np.float32)
         emo_vec = np.load(sample.emo_vec_path, allow_pickle=False).astype(np.float32)
         
-        # Load pattern features if available
-        pattern_features = None
-        if sample.pattern_features_path and sample.pattern_features_path.exists():
-            pf_data = np.load(sample.pattern_features_path, allow_pickle=True).item()
-            pattern_features = PatternFeatures(**pf_data)
-        
         return {
             "id": sample.id,
             "text_ids": torch.from_numpy(text_ids),
@@ -230,7 +222,8 @@ class PatternDataset(Dataset):
             "text_len": torch.tensor(sample.text_len, dtype=torch.long),
             "code_len": torch.tensor(sample.code_len, dtype=torch.long),
             "condition_len": torch.tensor(sample.condition_len, dtype=torch.long),
-            "pattern_features": pattern_features,
+            "has_stutters": sample.has_repetitions or sample.has_fillers,
+            "repetition_count": sample.repetition_count,
         }
 
 
@@ -249,8 +242,7 @@ def collate_batch(batch: List[Dict]) -> Dict:
     code_lengths = torch.stack([item["code_len"] for item in batch])
     cond_lengths = torch.stack([item["condition_len"] for item in batch])
     
-    # Collect pattern features (may be None for some samples)
-    pattern_features = [item["pattern_features"] for item in batch]
+    has_stutters = torch.tensor([item["has_stutters"] for item in batch], dtype=torch.bool)
     
     return {
         "ids": [item["id"] for item in batch],
@@ -261,7 +253,7 @@ def collate_batch(batch: List[Dict]) -> Dict:
         "text_lengths": text_lengths,
         "code_lengths": code_lengths,
         "condition_lengths": cond_lengths,
-        "pattern_features": pattern_features,
+        "has_stutters": has_stutters,
     }
 
 
@@ -270,7 +262,7 @@ def load_tokenizer(path: Path) -> TextTokenizer:
     return TextTokenizer(str(path), normalizer)
 
 
-def build_model(cfg_path: Path, tokenizer: TextTokenizer, checkpoint_path: Path, device: torch.device) -> UnifiedVoice:
+def build_model(cfg_path: Path, checkpoint_path: Path, device: torch.device) -> UnifiedVoice:
     """Load base GPT model."""
     cfg = OmegaConf.load(cfg_path)
     
@@ -282,8 +274,9 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, checkpoint_path: Path,
         checkpoint_dim = raw_state["mel_pos_embedding.emb.weight"].shape[1]
         if cfg.gpt.model_dim != checkpoint_dim:
             cfg.gpt.model_dim = checkpoint_dim
+            print(f"  Detected model_dim: {checkpoint_dim}")
     
-    # Filter state dict
+    # Filter state dict to remove inference model and LoRA artifacts
     filtered_state = {}
     for key, value in raw_state.items():
         if key.startswith("inference_model."):
@@ -322,18 +315,18 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, checkpoint_path: Path,
     return model.to(device)
 
 
-def compute_pattern_aware_loss(
+def compute_loss(
     model: nn.Module,
-    pattern_embedding: PatternEmbedding,
     batch: Dict,
     device: torch.device,
-    loss_fn: PatternAwareLoss,
-    injection_mode: str = "add",
+    text_weight: float = 0.2,
+    stutter_weight: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute loss with pattern embedding injection.
+    Compute training loss for verbatim text → codes mapping.
     
-    This is the KEY difference from standard training!
+    Key: We're training the model to predict semantic codes from verbatim text.
+    The verbatim text contains stutters, so the model learns the mapping!
     """
     base_model = model.base_model.model if hasattr(model, 'base_model') else model
     
@@ -343,34 +336,27 @@ def compute_pattern_aware_loss(
     emo_vec = batch["emo_vec"].to(device)
     text_lengths = batch["text_lengths"].to(device)
     code_lengths = batch["code_lengths"].to(device)
-    pattern_features = batch.get("pattern_features")
+    has_stutters = batch["has_stutters"].to(device)
     
     batch_size = text_ids.size(0)
     
-    # === INJECT PATTERN EMBEDDING ===
-    # This is what makes patterns learnable and transferable!
-    pattern_conditioned = pattern_embedding.get_injection_embedding(
-        condition,
-        injection_mode=injection_mode,
-    )
-    
-    # Build conditioning with pattern injection
+    # Build conditioning
     use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
     duration_ctrl = base_model.speed_emb(torch.ones_like(use_speed))
     duration_free = base_model.speed_emb(torch.zeros_like(use_speed))
     
-    # Add emotion and build final conditioning
     conds = torch.cat(
-        (pattern_conditioned + emo_vec.unsqueeze(1), 
+        (condition + emo_vec.unsqueeze(1), 
          duration_ctrl.unsqueeze(1), 
          duration_free.unsqueeze(1)),
         dim=1,
     )
     
-    # Process inputs (same as standard training)
+    # Position embedding limits
     max_text = base_model.text_pos_embedding.emb.num_embeddings
     max_mel = base_model.mel_pos_embedding.emb.num_embeddings
     
+    # Process text inputs (the VERBATIM text tokens!)
     text_inputs = base_model.set_text_padding(text_ids.clone(), text_lengths)
     if text_inputs.size(1) + 2 > max_text:
         max_len = max_text - 2
@@ -381,6 +367,7 @@ def compute_pattern_aware_loss(
         text_inputs, base_model.start_text_token, base_model.stop_text_token
     )
     
+    # Process mel codes (the audio semantic codes)
     mel_inputs = base_model.set_mel_padding(codes.clone(), code_lengths)
     if mel_inputs.size(1) + 2 > max_mel:
         max_len = max_mel - 2
@@ -400,7 +387,7 @@ def compute_pattern_aware_loss(
         conds, text_emb, base_model.text_head, mel_emb, base_model.mel_head
     )
     
-    # Masks
+    # Create masks for actual sequence lengths (not padding)
     text_mask = (
         torch.arange(text_targets.size(1), device=device).unsqueeze(0)
         < (text_lengths + 1).unsqueeze(1)
@@ -410,34 +397,46 @@ def compute_pattern_aware_loss(
         < (code_lengths + 1).unsqueeze(1)
     )
     
-    # === PATTERN-AWARE LOSS ===
-    mel_loss, mel_metrics = loss_fn(mel_logits, mel_targets, mel_mask, pattern_features)
-    
-    # Standard text loss
+    # Compute cross-entropy losses
     text_ce = F.cross_entropy(text_logits, text_targets, reduction='none')
-    text_loss = (text_ce * text_mask).sum() / text_mask.sum().clamp_min(1)
+    mel_ce = F.cross_entropy(mel_logits, mel_targets, reduction='none')
     
-    # Combined
-    total_loss = 0.2 * text_loss + 0.8 * mel_loss
+    # Apply masks
+    text_loss_per_sample = (text_ce * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp_min(1)
+    mel_loss_per_sample = (mel_ce * mel_mask).sum(dim=1) / mel_mask.sum(dim=1).clamp_min(1)
     
-    # Metrics
+    # Apply extra weight to samples with stutters!
+    # This makes the model prioritize learning stutter patterns
+    sample_weights = torch.ones(batch_size, device=device)
+    sample_weights[has_stutters] = stutter_weight
+    
+    text_loss = (text_loss_per_sample * sample_weights).mean()
+    mel_loss = (mel_loss_per_sample * sample_weights).mean()
+    
+    # Combined loss
+    total_loss = text_weight * text_loss + (1.0 - text_weight) * mel_loss
+    
+    # Compute accuracy metrics
     with torch.no_grad():
         mel_pred = mel_logits.permute(0, 2, 1).reshape(-1, mel_logits.size(1))
         mel_tgt = mel_targets.reshape(-1)
         mel_m = mel_mask.reshape(-1)
+        
         if mel_m.any():
             top1 = (mel_pred[mel_m].argmax(-1) == mel_tgt[mel_m]).float().mean().item()
+            # Top-10 accuracy
+            top10_pred = mel_pred[mel_m].topk(10, dim=-1).indices
+            top10 = (top10_pred == mel_tgt[mel_m].unsqueeze(1)).any(dim=1).float().mean().item()
         else:
             top1 = 0.0
+            top10 = 0.0
     
     metrics = {
         "text_loss": text_loss.item(),
-        "mel_loss": mel_metrics["total_loss"],
-        "mel_ce": mel_metrics.get("ce_loss", 0.0),
-        "pause_loss": mel_metrics.get("pause_loss", 0.0),
-        "rate_loss": mel_metrics.get("rate_loss", 0.0),
+        "mel_loss": mel_loss.item(),
         "mel_top1": top1,
-        "pattern_scale": pattern_embedding.pattern_scale.item(),
+        "mel_top10": top10,
+        "stutter_samples": has_stutters.sum().item(),
     }
     
     return total_loss, metrics
@@ -445,31 +444,28 @@ def compute_pattern_aware_loss(
 
 def evaluate(
     model: nn.Module,
-    pattern_embedding: PatternEmbedding,
     loader: DataLoader,
     device: torch.device,
-    loss_fn: PatternAwareLoss,
-    injection_mode: str,
+    text_weight: float,
 ) -> Dict[str, float]:
-    """Evaluate model."""
+    """Evaluate model on validation set."""
     model.eval()
-    pattern_embedding.eval()
     
-    totals = {"mel_loss": 0.0, "mel_top1": 0.0}
+    totals = {"mel_loss": 0.0, "mel_top1": 0.0, "mel_top10": 0.0}
     count = 0
     
     with torch.no_grad():
         for batch in loader:
-            _, metrics = compute_pattern_aware_loss(
-                model, pattern_embedding, batch, device, loss_fn, injection_mode
+            _, metrics = compute_loss(
+                model, batch, device, text_weight, stutter_weight=1.0
             )
             bsz = batch["text_ids"].size(0)
             totals["mel_loss"] += metrics["mel_loss"] * bsz
             totals["mel_top1"] += metrics["mel_top1"] * bsz
+            totals["mel_top10"] += metrics["mel_top10"] * bsz
             count += bsz
     
     model.train()
-    pattern_embedding.train()
     
     return {k: v / max(count, 1) for k, v in totals.items()}
 
@@ -484,21 +480,33 @@ def main():
     # Setup paths
     speaker_dir = PROJECT_ROOT / "training" / args.speaker
     
-    train_manifest = args.train_manifest or speaker_dir / "dataset" / "processed_v3" / "train_manifest.jsonl"
-    val_manifest = args.val_manifest or speaker_dir / "dataset" / "processed_v3" / "val_manifest.jsonl"
+    # Try verbatim dataset first, then fall back to v3/v2
+    if args.train_manifest:
+        train_manifest = args.train_manifest
+    else:
+        candidates = [
+            speaker_dir / "dataset" / "processed_verbatim" / "train_manifest.jsonl",
+            speaker_dir / "dataset" / "processed_v3" / "train_manifest.jsonl",
+            speaker_dir / "dataset" / "processed_v2" / "train_manifest.jsonl",
+        ]
+        train_manifest = None
+        for c in candidates:
+            if c.exists():
+                train_manifest = c
+                break
     
-    # Fall back to v2 if v3 doesn't exist
-    if not train_manifest.exists():
-        train_manifest = speaker_dir / "dataset" / "processed_v2" / "train_manifest.jsonl"
-        val_manifest = speaker_dir / "dataset" / "processed_v2" / "val_manifest.jsonl"
+    if args.val_manifest:
+        val_manifest = args.val_manifest
+    else:
+        val_manifest = train_manifest.parent / "val_manifest.jsonl" if train_manifest else None
     
-    if not train_manifest.exists():
-        print(f"❌ Manifest not found: {train_manifest}")
-        print("\nFirst prepare your dataset:")
-        print(f"  python tools/prepare_pattern_dataset.py --speaker {args.speaker}")
+    if not train_manifest or not train_manifest.exists():
+        print(f"❌ Manifest not found.")
+        print("\nFirst prepare your verbatim dataset:")
+        print(f"  python tools/prepare_verbatim_dataset.py --speaker {args.speaker}")
         sys.exit(1)
     
-    output_dir = args.output_dir or speaker_dir / "pattern_training"
+    output_dir = args.output_dir or speaker_dir / "verbatim_training"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Setup logging
@@ -506,62 +514,58 @@ def main():
     writer = SummaryWriter(log_dir=str(log_dir))
     
     print("=" * 60)
-    print("PATTERN EMBEDDING TRAINING")
+    print("VERBATIM LORA TRAINING")
     print("=" * 60)
     print(f"""
 Speaker: {args.speaker}
-Pattern tokens: {args.pattern_tokens}
-Injection mode: {args.injection_mode}
-LoRA rank: {args.lora_rank if not args.no_lora else 'DISABLED'}
+LoRA rank: {args.lora_rank}
+LoRA alpha: {args.lora_alpha}
 Epochs: {args.epochs}
+Batch size: {args.batch_size} × {args.grad_accumulation} = {args.batch_size * args.grad_accumulation} effective
+Learning rate: {args.learning_rate}
+Stutter weight: {args.stutter_weight}x
+
+Train manifest: {train_manifest}
+Output: {output_dir}
 """)
     
-    # Load tokenizer
-    tokenizer = load_tokenizer(args.tokenizer)
-    
     # Load base model
-    print("\n[1/4] Loading base model...")
-    model = build_model(args.config, tokenizer, args.base_checkpoint, device)
+    print("\n[1/3] Loading base model...")
+    model = build_model(args.config, args.base_checkpoint, device)
     
-    # Freeze base model
-    for param in model.parameters():
-        param.requires_grad = False
+    # Apply LoRA (PEFT handles freezing base model automatically)
+    print("\n[2/3] Applying LoRA adapters...")
+    model = apply_lora_to_model(
+        model,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        include_gpt=True,
+        include_conditioning=args.include_conditioning,
+        include_heads=args.include_heads,
+    )
     
-    # Apply LoRA (optional)
-    if not args.no_lora:
-        print("\n[2/4] Applying LoRA adapters...")
-        model = apply_lora_to_model(
-            model,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            include_gpt=True,
-            include_conditioning=True,
-            include_heads=True,
-        )
-        model_params = [p for p in model.parameters() if p.requires_grad]
-    else:
-        print("\n[2/4] LoRA disabled, training pattern embedding only...")
-        model_params = []
+    # CRITICAL: Enable input gradients for gradient checkpointing to work with LoRA
+    # Since UnifiedVoice doesn't have enable_input_require_grads(), we implement it manually
+    def make_inputs_require_grad(module, input, output):
+        output.requires_grad_(True)
     
-    # Create pattern embedding
-    print("\n[3/4] Creating pattern embedding...")
+    # Get the base model from PEFT wrapper
     base_model = model.base_model.model if hasattr(model, 'base_model') else model
-    model_dim = base_model.model_dim
     
-    pattern_embedding = PatternEmbedding(
-        model_dim=model_dim,
-        num_pattern_tokens=args.pattern_tokens,
-    ).to(device)
+    # Add hook to embedding layer to make outputs require grad
+    base_model.text_embedding.register_forward_hook(make_inputs_require_grad)
+    base_model.mel_embedding.register_forward_hook(make_inputs_require_grad)
     
-    print(f"  Pattern tokens: {args.pattern_tokens}")
-    print(f"  Model dimension: {model_dim}")
-    print(f"  Pattern embedding size: {sum(p.numel() for p in pattern_embedding.parameters()):,}")
+    param_stats = get_trainable_parameters(model)
+    trainable = param_stats["trainable_params"]
+    total = param_stats["all_params"]
+    print(f"  Trainable: {trainable:,} / {total:,} ({param_stats['trainable_percentage']:.2f}%)")
     
     # Load datasets
-    print("\n[4/4] Loading datasets...")
-    train_dataset = PatternDataset(train_manifest)
-    val_dataset = PatternDataset(val_manifest)
+    print("\n[3/3] Loading datasets...")
+    train_dataset = VerbatimDataset(train_manifest)
+    val_dataset = VerbatimDataset(val_manifest) if val_manifest and val_manifest.exists() else None
     
     train_loader = DataLoader(
         train_dataset,
@@ -571,29 +575,23 @@ Epochs: {args.epochs}
         collate_fn=collate_batch,
         pin_memory=torch.cuda.is_available(),
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_batch,
+    
+    val_loader = None
+    if val_dataset:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_batch,
+        )
+    
+    # Optimizer
+    optimizer = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.learning_rate,
+        weight_decay=0.01,
     )
-    
-    # Optimizer - separate LR for pattern embedding
-    param_groups = []
-    if model_params:
-        param_groups.append({
-            'params': model_params,
-            'lr': args.learning_rate,
-            'weight_decay': 0.01,
-        })
-    param_groups.append({
-        'params': pattern_embedding.parameters(),
-        'lr': args.pattern_lr,  # Often higher for pattern embedding
-        'weight_decay': 0.0,  # No decay for embedding
-    })
-    
-    optimizer = AdamW(param_groups)
     
     # Scheduler
     total_steps = args.epochs * len(train_loader) // args.grad_accumulation
@@ -601,12 +599,6 @@ Epochs: {args.epochs}
         optimizer,
         num_warmup_steps=args.warmup_steps,
         num_training_steps=total_steps,
-    )
-    
-    # Loss function with pattern-aware components
-    loss_fn = PatternAwareLoss(
-        pause_weight=args.pause_weight,
-        rate_weight=args.rate_weight,
     )
     
     # AMP
@@ -619,21 +611,22 @@ Epochs: {args.epochs}
     print("=" * 60)
     
     model.train()
-    pattern_embedding.train()
-    
     global_step = 0
     best_val_loss = float('inf')
     
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         epoch_samples = 0
+        epoch_stutter_samples = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         
         for batch_idx, batch in enumerate(pbar):
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                loss, metrics = compute_pattern_aware_loss(
-                    model, pattern_embedding, batch, device, loss_fn, args.injection_mode
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                loss, metrics = compute_loss(
+                    model, batch, device,
+                    text_weight=args.text_weight,
+                    stutter_weight=args.stutter_weight,
                 )
             
             scaled_loss = loss / args.grad_accumulation
@@ -643,15 +636,16 @@ Epochs: {args.epochs}
             else:
                 scaled_loss.backward()
             
-            epoch_loss += loss.item() * batch["text_ids"].size(0)
-            epoch_samples += batch["text_ids"].size(0)
+            bsz = batch["text_ids"].size(0)
+            epoch_loss += loss.item() * bsz
+            epoch_samples += bsz
+            epoch_stutter_samples += metrics["stutter_samples"]
             
             if (batch_idx + 1) % args.grad_accumulation == 0:
                 if args.grad_clip > 0:
                     if use_amp:
                         scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    torch.nn.utils.clip_grad_norm_(pattern_embedding.parameters(), args.grad_clip)
                 
                 if use_amp:
                     scaler.step(optimizer)
@@ -668,89 +662,57 @@ Epochs: {args.epochs}
                 if global_step % args.log_interval == 0:
                     writer.add_scalar("train/loss", metrics["mel_loss"], global_step)
                     writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
-                    writer.add_scalar("train/pattern_scale", metrics["pattern_scale"], global_step)
+                    writer.add_scalar("train/mel_top10", metrics["mel_top10"], global_step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
-                    
-                    if metrics.get("pause_loss", 0) > 0:
-                        writer.add_scalar("train/pause_loss", metrics["pause_loss"], global_step)
                 
-                # Update progress bar
                 pbar.set_postfix({
                     "loss": f"{metrics['mel_loss']:.4f}",
                     "top1": f"{metrics['mel_top1']:.3f}",
-                    "scale": f"{metrics['pattern_scale']:.3f}",
+                    "top10": f"{metrics['mel_top10']:.3f}",
                 })
                 
                 # Checkpoint
                 if global_step % args.save_interval == 0:
                     ckpt_dir = output_dir / f"checkpoint_step{global_step}"
-                    ckpt_dir.mkdir(exist_ok=True)
-                    
-                    # Save LoRA
-                    if not args.no_lora:
-                        save_lora_checkpoint(model, ckpt_dir / "lora", {"step": global_step})
-                    
-                    # Save pattern embedding
-                    pattern_embedding.save(
-                        ckpt_dir / "pattern_embedding.pt",
-                        metadata={"step": global_step, "epoch": epoch}
-                    )
+                    save_lora_checkpoint(model, ckpt_dir, {"step": global_step})
         
         # End of epoch
         avg_train_loss = epoch_loss / max(epoch_samples, 1)
         
+        print(f"\nEpoch {epoch+1}: train_loss={avg_train_loss:.4f}, "
+              f"stutter_samples={epoch_stutter_samples}/{epoch_samples}")
+        
         # Validation
-        val_metrics = evaluate(model, pattern_embedding, val_loader, device, loss_fn, args.injection_mode)
-        
-        writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
-        writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
-        
-        print(f"\nEpoch {epoch+1}: train_loss={avg_train_loss:.4f}, val_loss={val_metrics['mel_loss']:.4f}")
-        
-        if val_metrics["mel_loss"] < best_val_loss:
-            best_val_loss = val_metrics["mel_loss"]
+        if val_loader:
+            val_metrics = evaluate(model, val_loader, device, args.text_weight)
             
-            # Save best checkpoint
-            best_dir = output_dir / "best_checkpoint"
-            best_dir.mkdir(exist_ok=True)
+            writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
+            writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+            writer.add_scalar("val/mel_top10", val_metrics["mel_top10"], global_step)
             
-            if not args.no_lora:
-                save_lora_checkpoint(model, best_dir / "lora", {
+            print(f"  val_loss={val_metrics['mel_loss']:.4f}, "
+                  f"val_top1={val_metrics['mel_top1']:.3f}")
+            
+            if val_metrics["mel_loss"] < best_val_loss:
+                best_val_loss = val_metrics["mel_loss"]
+                
+                best_dir = output_dir / "best_checkpoint"
+                save_lora_checkpoint(model, best_dir, {
                     "epoch": epoch,
                     "val_loss": best_val_loss,
+                    "speaker": args.speaker,
                 })
-            
-            pattern_embedding.save(
-                best_dir / "pattern_embedding.pt",
-                metadata={
-                    "epoch": epoch,
-                    "val_loss": best_val_loss,
-                    "pattern_tokens": args.pattern_tokens,
-                    "injection_mode": args.injection_mode,
-                }
-            )
-            print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
+                print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
     
     # Save final checkpoint
     final_dir = output_dir / "final_checkpoint"
-    final_dir.mkdir(exist_ok=True)
-    
-    if not args.no_lora:
-        save_lora_checkpoint(model, final_dir / "lora", {
-            "epochs": args.epochs,
-            "final_val_loss": val_metrics["mel_loss"],
-        })
-    
-    pattern_embedding.save(
-        final_dir / "pattern_embedding.pt",
-        metadata={
-            "epochs": args.epochs,
-            "final_val_loss": val_metrics["mel_loss"],
-            "pattern_tokens": args.pattern_tokens,
-            "injection_mode": args.injection_mode,
-            "speaker": args.speaker,
-        }
-    )
+    save_lora_checkpoint(model, final_dir, {
+        "epochs": args.epochs,
+        "final_val_loss": val_metrics["mel_loss"] if val_loader else avg_train_loss,
+        "speaker": args.speaker,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+    })
     
     writer.close()
     
@@ -761,19 +723,35 @@ Epochs: {args.epochs}
 Best validation loss: {best_val_loss:.4f}
 
 Output files:
-  Pattern embedding: {final_dir / 'pattern_embedding.pt'}
-  {'LoRA checkpoint: ' + str(final_dir / 'lora') if not args.no_lora else '(No LoRA)'}
-  Best checkpoint: {output_dir / 'best_checkpoint'}
+  Final LoRA: {final_dir}
+  Best LoRA: {output_dir / 'best_checkpoint'}
 
-To use for inference:
-    python tools/infer_with_patterns.py \\
-        --speaker {args.speaker} \\
-        --text "Your text here"
+HOW TO USE:
+===========
+1. For inference WITH stutters, input verbatim text:
 
-WHY THIS WORKS:
-The pattern embedding is a learnable "trigger" that tells the model
-"speak with this person's patterns". It's used both in training AND 
-inference, so patterns transfer!
+    from indextts import IndexTTS2
+    
+    tts = IndexTTS2(lora_path="{final_dir}")
+    
+    # Input with stutters → Output has stutters!
+    tts.infer(
+        spk_audio_prompt="reference.wav",
+        text="I I I was going going to the store...",
+        output_path="output.wav"
+    )
+
+2. For clean speech, input clean text:
+
+    tts.infer(
+        spk_audio_prompt="reference.wav", 
+        text="I was going to the store.",
+        output_path="output_clean.wav"
+    )
+
+The model has learned the DIRECT mapping:
+  stuttered text → stuttered speech
+  clean text → clean speech
 """)
 
 

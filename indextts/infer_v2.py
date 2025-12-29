@@ -108,8 +108,6 @@ class IndexTTS2:
                 device=self.device
             )
             print(">> LoRA adapters loaded and merged successfully")
-            # Store base model state for dynamic loading
-            self.base_gpt_state = {k: v.clone() for k, v in self.gpt.named_parameters()}
         
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:
@@ -117,6 +115,8 @@ class IndexTTS2:
         else:
             self.gpt.eval()
         print(">> GPT weights restored from:", self.gpt_path)
+
+        self.base_gpt_state = {k: v.clone() for k, v in self.gpt.named_parameters()}
 
         if use_deepspeed:
             try:
@@ -239,9 +239,6 @@ class IndexTTS2:
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
-        
-        # Store base model weights for dynamic LoRA loading
-        self.base_gpt_state = None
 
     def load_lora(self, lora_path):
         """

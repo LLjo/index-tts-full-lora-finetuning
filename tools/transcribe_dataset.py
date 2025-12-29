@@ -112,7 +112,20 @@ class WhisperTranscriber:
     
     def _load_model(self):
         """Load Whisper model."""
+
         if self.use_faster_whisper:
+            try:
+                from faster_whisper import WhisperModel
+                print(f"Loading faster-whisper model: {self.model_name} on {self.device}...")
+                self.model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type)
+                self._transcribe_fn = self._transcribe_faster_whisper
+                print('✓ faster-whisper loaded successfully')
+                return
+            except ImportError:
+                print("faster-whisper not found. Falling back to NeMo/Standard...")
+            except Exception as e:
+                print(f"Failed to load faster-whisper: {e}")
+        else:
             try:
                 import nemo.collections.asr as nemo_asr
                 self.model = nemo_asr.models.ASRModel.from_pretrained(
@@ -128,6 +141,34 @@ class WhisperTranscriber:
                 traceback.print_exc()
 
 
+    def _transcribe_faster_whisper(
+            self,
+            audio_path: str,
+            language: Optional[str] = None,
+        ) -> Tuple[str, List[WordTiming], str]:
+            """Transcribe using faster-whisper."""
+            segments, info = self.model.transcribe(
+                audio_path, 
+                language=language, 
+                word_timestamps=True,
+                beam_size=5
+            )
+            
+            full_text = ""
+            words = []
+            
+            for segment in segments:
+                full_text += segment.text + " "
+                if segment.words:
+                    for w in segment.words:
+                        words.append(WordTiming(
+                            word=w.word.strip(),
+                            start=w.start,
+                            end=w.end,
+                            probability=w.probability
+                        ))
+            
+            return full_text.strip(), words, info.language
     
     def _transcribe_nemo(
         self,

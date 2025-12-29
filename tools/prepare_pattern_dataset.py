@@ -1,46 +1,23 @@
 #!/usr/bin/env python3
 """
-Dataset Preparation for Speaking Pattern Training (e.g., Goldblum-style hesitations)
+Pattern Dataset Preparation v3 for IndexTTS2
 
-This script prepares training data specifically designed to capture SPEAKING PATTERNS:
-- Pauses and hesitations
-- "Uh", "um", "ah" fillers
-- Repetitions and restarts  
-- Rhythm and pacing
+This prepares datasets for PATTERN EMBEDDING training - the new approach
+that actually makes speaking patterns work!
 
-KEY INSIGHT:
-============
-To train the model to reproduce speaking patterns, we need:
-
-1. VERBATIM transcriptions that include fillers, pauses, etc.
-   - Original: "Hello world"
-   - Verbatim: "Hello... uh... world"
-   
-2. OR: Clean transcriptions + pattern markers inferred from audio timing
-   - The model learns: for this speaker, add pauses even if not in text
-
-3. Consistent speaker embeddings at inference (from training audio)
-
-TRANSCRIPTION FORMAT:
-====================
-Support special markers in transcriptions:
-
-  [PAUSE]     - Short pause (100-300ms)
-  [LONG]      - Long pause (300-1000ms)  
-  [UH]        - "Uh" hesitation filler
-  [UM]        - "Um" hesitation filler
-  [BREATH]    - Audible breath
-  ...         - Ellipsis = natural trailing pause
-  
-Example verbatim transcription:
-  "Well [PAUSE] you know [UH] life... [LONG] life finds a way"
+Key differences from v2:
+1. Extracts PATTERN FEATURES from each audio (pauses, stutters, rate)
+2. Saves pattern features alongside standard features
+3. Pattern features enable pattern-aware loss during training
 
 Usage:
-    python tools/prepare_pattern_dataset.py \
-        --audio-dir training/goldblum/dataset/audio \
-        --transcripts training/goldblum/dataset/transcripts_verbatim.csv \
-        --output-dir training/goldblum/dataset/processed \
-        --detect-pauses  # Auto-detect pauses from audio timing
+    # Basic usage
+    python tools/prepare_pattern_dataset.py --speaker ozzy
+    
+    # With custom options  
+    python tools/prepare_pattern_dataset.py --speaker ozzy \
+        --pause-threshold 0.3 \
+        --detect-stutters
 """
 
 from __future__ import annotations
@@ -51,277 +28,319 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
 import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
 
 import librosa
 import numpy as np
 import torch
 import torchaudio
 from tqdm import tqdm
-from dataclasses import dataclass
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-
-@dataclass  
-class PauseMarker:
-    """Represents a detected pause in audio."""
-    start_time: float
-    end_time: float
-    duration: float
-    pause_type: str  # SHORT, MEDIUM, LONG
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def detect_pauses_in_audio(
-    audio: np.ndarray, 
-    sr: int,
-    silence_threshold_db: float = -40,
-    min_pause_duration: float = 0.15,
-    short_pause_max: float = 0.3,
-    medium_pause_max: float = 0.7,
-) -> List[PauseMarker]:
-    """
-    Detect pauses (silence) in audio using energy-based analysis.
+@dataclass
+class ExtractedPatternFeatures:
+    """Pattern features extracted from audio and transcript."""
+    pause_positions: List[int]
+    pause_durations: List[float]
+    filler_positions: List[int]
+    stutter_positions: List[int]
+    speech_rate: float
+    rate_variations: List[float]
+    total_duration: float
+    num_pauses: int
+    num_fillers: int
+    num_stutters: int
+
+
+class PatternAnalyzer:
+    """Analyze audio and transcripts to extract speaking patterns."""
     
-    Returns list of PauseMarker with timing and classification.
-    """
-    # Convert to mono if needed
-    if audio.ndim > 1:
-        audio = audio.mean(axis=0)
+    SILENCE_CODES = {52}  # IndexTTS2's silence code
+    PAUSE_THRESHOLD = 3  # Consecutive silence codes = pause
     
-    # Calculate frame-wise energy
-    frame_length = int(0.025 * sr)  # 25ms frames
-    hop_length = int(0.010 * sr)    # 10ms hop
+    FILLER_PATTERNS = [
+        r'\b(uh+|uhh+)\b',
+        r'\b(um+|umm+)\b',
+        r'\b(er+|err+)\b',
+        r'\b(ah+|ahh+)\b',
+        r'\[UH\]', r'\[UM\]', r'\[ER\]', r'\[AH\]',
+        r'\[PAUSE\]', r'\[LONG\]', r'\[BREATH\]',
+    ]
     
-    # RMS energy per frame
-    frames = librosa.util.frame(audio, frame_length=frame_length, hop_length=hop_length)
-    rms = np.sqrt(np.mean(frames ** 2, axis=0))
-    rms_db = librosa.amplitude_to_db(rms + 1e-10)
+    STUTTER_PATTERNS = [
+        r'\b(\w+)\s+\1\b',           # Repeated whole words (e.g., "I I", "Now Now")
+        r'\b(\w+)-\1\b',             # Word-word with hyphen
+        r'\b(\w{1,3})-\1',           # Short repeated syllables
+        r'\b[a-zA-Z]\b(?!\s+[a-zA-Z]\b)', # Single characters followed by a pause/word (e.g., "w")
+        r'\.{3,}',                   # Long ellipsis
+    ]
     
-    # Find silent frames
-    is_silent = rms_db < silence_threshold_db
+    def __init__(
+        self,
+        silence_codes: Optional[set] = None,
+        pause_threshold: int = 3,
+    ):
+        self.silence_codes = silence_codes or self.SILENCE_CODES
+        self.pause_threshold = pause_threshold
     
-    # Find pause regions (consecutive silent frames)
-    pauses = []
-    in_pause = False
-    pause_start = 0
-    
-    for i, silent in enumerate(is_silent):
-        time = i * hop_length / sr
+    def analyze_codes(
+        self,
+        codes: np.ndarray,
+        text: str,
+        audio_duration: float,
+    ) -> ExtractedPatternFeatures:
+        """
+        Extract pattern features from semantic codes and transcript.
         
-        if silent and not in_pause:
-            # Start of pause
-            in_pause = True
-            pause_start = time
-        elif not silent and in_pause:
-            # End of pause
-            in_pause = False
-            pause_end = time
-            duration = pause_end - pause_start
+        Args:
+            codes: Semantic codes (1D array)
+            text: Transcript text
+            audio_duration: Duration in seconds
             
-            if duration >= min_pause_duration:
-                # Classify pause type
-                if duration < short_pause_max:
-                    pause_type = "SHORT"
-                elif duration < medium_pause_max:
-                    pause_type = "MEDIUM"
-                else:
-                    pause_type = "LONG"
-                
-                pauses.append(PauseMarker(
-                    start_time=pause_start,
-                    end_time=pause_end,
-                    duration=duration,
-                    pause_type=pause_type
-                ))
-    
-    return pauses
-
-
-def detect_fillers_in_audio(
-    audio: np.ndarray,
-    sr: int,
-    transcript: str,
-) -> List[Tuple[float, str]]:
-    """
-    Attempt to detect filler words (uh, um) using simple heuristics.
-    
-    NOTE: This is a simplified detection. For production use, consider:
-    - Whisper with word-level timestamps
-    - Forced alignment tools
-    - Manual annotation
-    
-    Returns list of (timestamp, filler_type) tuples.
-    """
-    # This is a placeholder - actual filler detection requires ASR with timestamps
-    # For now, return empty list (user should provide verbatim transcripts)
-    return []
-
-
-def insert_pauses_into_transcript(
-    transcript: str,
-    pauses: List[PauseMarker],
-    audio_duration: float,
-    words_per_second: float = 2.5,  # Approximate speaking rate
-) -> str:
-    """
-    Insert pause markers into transcript at estimated positions.
-    
-    This is an approximation - for best results, use verbatim transcriptions.
-    """
-    words = transcript.split()
-    if not words:
-        return transcript
-    
-    # Estimate word timing (very rough)
-    word_duration = 1.0 / words_per_second
-    
-    result_words = []
-    current_time = 0.0
-    word_idx = 0
-    
-    # Sort pauses by start time
-    sorted_pauses = sorted(pauses, key=lambda p: p.start_time)
-    pause_idx = 0
-    
-    for word in words:
-        # Check if there's a pause before this word
-        while pause_idx < len(sorted_pauses):
-            pause = sorted_pauses[pause_idx]
-            if pause.start_time < current_time + word_duration:
-                # Insert pause marker
-                if pause.pause_type == "LONG":
-                    result_words.append("[LONG]")
-                elif pause.pause_type == "MEDIUM":
-                    result_words.append("[PAUSE]")
-                # SHORT pauses might just be natural word boundaries
-                pause_idx += 1
-            else:
-                break
+        Returns:
+            ExtractedPatternFeatures
+        """
+        codes = codes.flatten()
         
-        result_words.append(word)
-        current_time += word_duration
+        # Analyze pauses from codes
+        pause_positions, pause_durations = self._find_pauses_in_codes(
+            codes, audio_duration
+        )
+        
+        # Analyze text for fillers
+        filler_positions = self._find_fillers_in_text(text)
+        
+        # Analyze text for stutters
+        stutter_positions = self._find_stutters_in_text(text)
+        
+        # Calculate speech rate
+        word_count = len([w for w in text.split() if not w.startswith('[')])
+        speech_rate = word_count / max(audio_duration, 0.1)
+        
+        # Estimate rate variations
+        rate_variations = self._estimate_rate_variations(codes)
+        
+        return ExtractedPatternFeatures(
+            pause_positions=pause_positions,
+            pause_durations=pause_durations,
+            filler_positions=filler_positions,
+            stutter_positions=stutter_positions,
+            speech_rate=speech_rate,
+            rate_variations=rate_variations,
+            total_duration=audio_duration,
+            num_pauses=len(pause_positions),
+            num_fillers=len(filler_positions),
+            num_stutters=len(stutter_positions),
+        )
     
-    return " ".join(result_words)
+    def _find_pauses_in_codes(
+        self,
+        codes: np.ndarray,
+        audio_duration: float,
+    ) -> Tuple[List[int], List[float]]:
+        """Find pause positions and durations from codes."""
+        positions = []
+        durations = []
+        
+        run_start = None
+        run_length = 0
+        
+        for i, code in enumerate(codes):
+            if code in self.silence_codes:
+                if run_start is None:
+                    run_start = i
+                run_length += 1
+            else:
+                if run_length >= self.pause_threshold:
+                    positions.append(run_start)
+                    # Estimate duration
+                    duration_per_code = audio_duration / max(len(codes), 1)
+                    durations.append(run_length * duration_per_code * 1000)  # ms
+                run_start = None
+                run_length = 0
+        
+        # Check final run
+        if run_length >= self.pause_threshold:
+            positions.append(run_start)
+            duration_per_code = audio_duration / max(len(codes), 1)
+            durations.append(run_length * duration_per_code * 1000)
+        
+        return positions, durations
+    
+    def _find_fillers_in_text(self, text: str) -> List[int]:
+        """Find filler word positions."""
+        positions = []
+        for pattern in self.FILLER_PATTERNS:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                positions.append(match.start())
+        return sorted(set(positions))
+    
+    def _find_stutters_in_text(self, text: str) -> List[int]:
+        """Find stutter/repetition positions."""
+        positions = []
+        
+        # 1. Standard Regex Checks
+        for pattern in self.STUTTER_PATTERNS:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                positions.append(match.start())
+        
+        # 2. Logic for repetitions across [PAUSE] tags
+        # Clean text of tags to find hidden repetitions like "Now [PAUSE] Now"
+        clean_text = re.sub(r'\[.*?\]', ' ', text)
+        words = clean_text.split()
+        for i in range(len(words) - 1):
+            if words[i].lower() == words[i+1].lower() and len(words[i]) > 0:
+                # Find where this word is in the ORIGINAL text to get the position
+                match = re.search(rf'\b{re.escape(words[i])}\b', text)
+                if match:
+                    positions.append(match.start())
+                    
+        return sorted(set(positions))
+    
+    def _estimate_rate_variations(
+        self,
+        codes: np.ndarray,
+        window_size: int = 50,
+    ) -> List[float]:
+        """Estimate local speech rate variations."""
+        if len(codes) < window_size:
+            return [1.0]
+        
+        variations = []
+        for i in range(0, len(codes) - window_size, window_size // 2):
+            window = codes[i:i + window_size]
+            silence_ratio = sum(1 for c in window if c in self.silence_codes) / len(window)
+            # Convert to rate multiplier
+            rate = max(0.1, (1.0 - silence_ratio) * 2)
+            variations.append(rate)
+        
+        return variations
 
 
-def normalize_transcript_markers(text: str) -> str:
-    """
-    Normalize various pause/filler notations to standard format.
-    """
-    # Normalize ellipsis variations
-    text = re.sub(r'\.{2,}', '...', text)
-    
-    # Normalize common filler spellings
-    text = re.sub(r'\b(uh+|uhh+)\b', '[UH]', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(um+|umm+|hmm+)\b', '[UM]', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(ah+|ahh+)\b', '[AH]', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(er+|err+)\b', '[ER]', text, flags=re.IGNORECASE)
-    
-    # Normalize explicit pause markers
-    text = re.sub(r'\[pause\]', '[PAUSE]', text, flags=re.IGNORECASE)
-    text = re.sub(r'\[long\s*pause\]', '[LONG]', text, flags=re.IGNORECASE)
-    text = re.sub(r'\[breath\]', '[BREATH]', text, flags=re.IGNORECASE)
-    
-    # Clean up multiple spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    return text
-
-
-def prepare_training_text(
-    transcript: str,
-    audio: np.ndarray,
-    sr: int,
-    detect_pauses: bool = True,
-    audio_duration: float = None,
-) -> str:
-    """
-    Prepare transcript for training, optionally detecting and inserting pauses.
-    """
-    # First normalize any existing markers
-    transcript = normalize_transcript_markers(transcript)
-    
-    # If transcript already has markers, use as-is
-    has_markers = any(marker in transcript for marker in ['[PAUSE]', '[LONG]', '[UH]', '[UM]', '...'])
-    
-    if has_markers:
-        return transcript
-    
-    # Optionally detect and insert pauses
-    if detect_pauses:
-        pauses = detect_pauses_in_audio(audio, sr)
-        if pauses:
-            audio_duration = audio_duration or len(audio) / sr
-            transcript = insert_pauses_into_transcript(transcript, pauses, audio_duration)
-    
-    return transcript
-
-
-def load_transcripts_verbatim(transcript_path: Path) -> Dict[str, str]:
-    """
-    Load transcriptions, preserving verbatim content including fillers/pauses.
-    """
+def load_transcripts(path: Path) -> Dict[str, str]:
+    """Load transcripts from CSV or JSON."""
     transcripts = {}
     
-    if transcript_path.suffix.lower() == ".csv":
-        with open(transcript_path, "r", encoding="utf-8") as f:
+    if path.suffix.lower() == ".csv":
+        with open(path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 filename = row.get("filename") or row.get("audio")
-                # Support both 'text' and 'verbatim' columns
                 text = row.get("verbatim") or row.get("text") or row.get("transcription")
                 if filename and text:
-                    transcripts[filename] = text  # Don't strip - preserve spacing
+                    transcripts[filename] = text
     
-    elif transcript_path.suffix.lower() == ".json":
-        with open(transcript_path, "r", encoding="utf-8") as f:
+    elif path.suffix.lower() == ".json":
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
             if isinstance(data, list):
                 for item in data:
                     filename = item.get("filename") or item.get("audio")
                     text = item.get("verbatim") or item.get("text")
                     if filename and text:
                         transcripts[filename] = text
-            elif isinstance(data, dict):
+            else:
                 transcripts = dict(data)
     
     return transcripts
 
 
+def normalize_transcript(text: str) -> str:
+    """Normalize transcript markers."""
+    text = re.sub(r'\.{2,}', '...', text)
+    text = re.sub(r'\b(uh+|uhh+)\b', '[UH]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(um+|umm+|hmm+)\b', '[UM]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(ah+|ahh+)\b', '[AH]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(er+|err+)\b', '[ER]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[pause\]', '[PAUSE]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[long\s*pause\]', '[LONG]', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare dataset for speaking pattern training"
+        description="Prepare pattern dataset v3 with pattern feature extraction",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
-    parser.add_argument("--audio-dir", type=Path, required=True)
-    parser.add_argument("--transcripts", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model-dir", type=Path, default=Path("checkpoints"))
-    parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"))
-    parser.add_argument("--detect-pauses", action="store_true",
-                        help="Auto-detect pauses from audio and insert markers")
-    parser.add_argument("--train-split", type=float, default=0.9)
-    parser.add_argument("--max-duration", type=float, default=15.0)
+    
+    parser.add_argument("--speaker", "-s", help="Speaker name")
+    parser.add_argument("--audio-dir", type=Path, help="Audio directory")
+    parser.add_argument("--transcripts", type=Path, help="Transcripts file")
+    parser.add_argument("--output-dir", type=Path, help="Output directory")
+    
+    # Pattern conditioning
+    parser.add_argument("--pattern-conditioning", type=Path,
+                        help="Global pattern conditioning file (from v2)")
+    
+    # Pattern analysis options
+    parser.add_argument("--pause-threshold", type=int, default=3,
+                        help="Consecutive silence codes for pause detection")
     parser.add_argument("--min-duration", type=float, default=1.0)
+    parser.add_argument("--max-duration", type=float, default=15.0)
+    parser.add_argument("--train-split", type=float, default=0.9)
+    
+    parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"))
+    parser.add_argument("--model-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--device", type=str, default=None)
     
     args = parser.parse_args()
     
-    print("="*60)
-    print("SPEAKING PATTERN DATASET PREPARATION")
-    print("="*60)
-    print("\nThis tool prepares data to train speaking PATTERNS:")
-    print("  - Pauses and hesitations")
-    print("  - Filler words (uh, um)")
-    print("  - Rhythm and pacing")
-    print("\nFor best results, provide VERBATIM transcriptions!")
-    print("="*60)
+    # Resolve paths
+    if args.speaker:
+        speaker_dir = PROJECT_ROOT / "training" / args.speaker / "dataset"
+        audio_dir = args.audio_dir or speaker_dir / "audio"
+        transcripts_path = args.transcripts or speaker_dir / "transcripts_verbatim.csv"
+        output_dir = args.output_dir or speaker_dir / "processed_v3"
+        
+        # Try to find pattern conditioning from v2
+        if args.pattern_conditioning is None:
+            pattern_cond_path = PROJECT_ROOT / "training" / args.speaker / "pattern_conditioning.pt"
+            if pattern_cond_path.exists():
+                args.pattern_conditioning = pattern_cond_path
+    else:
+        if not args.audio_dir or not args.transcripts or not args.output_dir:
+            parser.error("--speaker or all of --audio-dir, --transcripts, --output-dir required")
+        audio_dir = args.audio_dir
+        transcripts_path = args.transcripts
+        output_dir = args.output_dir
     
-    # Import required modules
+    print("=" * 60)
+    print("PATTERN DATASET PREPARATION v3")
+    print("=" * 60)
+    print(f"\nAudio: {audio_dir}")
+    print(f"Transcripts: {transcripts_path}")
+    print(f"Output: {output_dir}")
+    
+    # Validate
+    if not audio_dir.exists():
+        print(f"❌ Audio directory not found: {audio_dir}")
+        sys.exit(1)
+    if not transcripts_path.exists():
+        print(f"❌ Transcripts not found: {transcripts_path}")
+        sys.exit(1)
+    
+    # Load global conditioning if available
+    global_condition = None
+    global_emo_vec = None
+    if args.pattern_conditioning and args.pattern_conditioning.exists():
+        print(f"\n[*] Loading global conditioning from: {args.pattern_conditioning}")
+        from indextts.pattern_conditioning import PatternConditioningStore
+        cond_data = PatternConditioningStore.load(args.pattern_conditioning)
+        global_condition = cond_data['gpt_conditioning'].squeeze(0).numpy().astype(np.float32)
+        global_emo_vec = cond_data['emo_vec'].squeeze(0).numpy().astype(np.float32)
+        print(f"  Condition shape: {global_condition.shape}")
+    
+    # Load models
+    print("\n[1/5] Loading models...")
+    
     from transformers import SeamlessM4TFeatureExtractor
     from omegaconf import OmegaConf
     from huggingface_hub import hf_hub_download
@@ -332,19 +351,10 @@ def main():
     from indextts.gpt.model_v2 import UnifiedVoice
     from indextts.utils.checkpoint import load_checkpoint
     
-    # Setup device
-    if args.device is None:
-        if torch.cuda.is_available():
-            device = "cuda:0"
-        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-    else:
-        device = args.device
-    print(f"\nUsing device: {device}")
+    device = args.device
+    if device is None:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
     
-    # Load config and models
     cfg = OmegaConf.load(args.config)
     
     # Tokenizer
@@ -363,47 +373,44 @@ def main():
     
     # Semantic codec
     semantic_codec = build_semantic_codec(cfg.semantic_codec)
-    semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
-    safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
+    codec_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+    safetensors.torch.load_model(semantic_codec, codec_ckpt)
     semantic_codec = semantic_codec.to(device).eval()
     
-    # GPT model
-    gpt_path = args.model_dir / cfg.gpt_checkpoint
-    checkpoint = torch.load(gpt_path, map_location="cpu")
-    raw_state = checkpoint.get("model", checkpoint)
-    if "mel_pos_embedding.emb.weight" in raw_state:
-        checkpoint_model_dim = raw_state["mel_pos_embedding.emb.weight"].shape[1]
-        if cfg.gpt.model_dim != checkpoint_model_dim:
-            cfg.gpt.model_dim = checkpoint_model_dim
+    # GPT for conditioning (if we need to extract)
+    gpt = None
+    if global_condition is None:
+        print("  Loading GPT for conditioning extraction...")
+        gpt_path = args.model_dir / cfg.gpt_checkpoint
+        checkpoint = torch.load(gpt_path, map_location="cpu")
+        raw_state = checkpoint.get("model", checkpoint)
+        if "mel_pos_embedding.emb.weight" in raw_state:
+            checkpoint_dim = raw_state["mel_pos_embedding.emb.weight"].shape[1]
+            if cfg.gpt.model_dim != checkpoint_dim:
+                cfg.gpt.model_dim = checkpoint_dim
+        gpt = UnifiedVoice(**cfg.gpt)
+        load_checkpoint(gpt, str(gpt_path))
+        gpt = gpt.to(device).eval()
     
-    gpt = UnifiedVoice(**cfg.gpt)
-    load_checkpoint(gpt, str(gpt_path))
-    gpt = gpt.to(device).eval()
+    max_text_tokens = 120  # Safe default
+    max_mel_tokens = 500
     
-    print("Models loaded.\n")
+    # Pattern analyzer
+    analyzer = PatternAnalyzer(pause_threshold=args.pause_threshold)
     
     # Load transcripts
-    transcripts = load_transcripts_verbatim(args.transcripts)
-    print(f"Loaded {len(transcripts)} transcriptions")
-    
-    # Check for verbatim markers
-    verbatim_count = sum(1 for t in transcripts.values() if any(m in t for m in ['[', '...', 'uh', 'um', 'Uh', 'Um']))
-    if verbatim_count == 0 and not args.detect_pauses:
-        print("\n⚠️  WARNING: No verbatim markers found in transcriptions!")
-        print("   For best pattern training, provide transcriptions like:")
-        print('   "Well [PAUSE] you know [UH] life... life finds a way"')
-        print("   Or use --detect-pauses to auto-detect from audio")
-    else:
-        print(f"   {verbatim_count} transcripts have verbatim markers")
+    print("\n[2/5] Loading transcripts...")
+    transcripts = load_transcripts(transcripts_path)
+    print(f"  Loaded {len(transcripts)} transcriptions")
     
     # Find audio files
     audio_extensions = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
     audio_files = []
     for ext in audio_extensions:
-        audio_files.extend(args.audio_dir.glob(f"*{ext}"))
-        audio_files.extend(args.audio_dir.glob(f"*{ext.upper()}"))
+        audio_files.extend(audio_dir.glob(f"*{ext}"))
+        audio_files.extend(audio_dir.glob(f"*{ext.upper()}"))
     audio_files = sorted(audio_files)
-    print(f"Found {len(audio_files)} audio files")
+    print(f"  Found {len(audio_files)} audio files")
     
     # Match audio with transcripts
     matched = []
@@ -412,27 +419,35 @@ def main():
             if candidate in transcripts:
                 matched.append((audio_path, transcripts[candidate]))
                 break
+    print(f"  Matched {len(matched)} pairs")
     
-    print(f"Matched {len(matched)} audio-transcript pairs")
-    
-    if len(matched) == 0:
-        print("ERROR: No matches found!")
+    if not matched:
+        print("❌ No matching audio-transcript pairs!")
         sys.exit(1)
     
-    # Process files
-    print("\nProcessing audio files...")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    features_dir = args.output_dir / "features"
+    # Process
+    print("\n[3/5] Processing audio files...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    features_dir = output_dir / "features"
     features_dir.mkdir(exist_ok=True)
     
-    manifest_entries = []
-    pattern_stats = {"with_markers": 0, "pauses_detected": 0, "total_pauses": 0}
+    # Save global conditioning if we have it
+    if global_condition is not None:
+        np.save(features_dir / "GLOBAL_condition.npy", global_condition)
+        np.save(features_dir / "GLOBAL_emo_vec.npy", global_emo_vec)
     
-    max_text_tokens = gpt.text_pos_embedding.emb.num_embeddings - 2
-    max_mel_tokens = gpt.mel_pos_embedding.emb.num_embeddings - 2
+    manifest_entries = []
+    pattern_stats = {
+        "total_pauses": 0,
+        "total_fillers": 0,
+        "total_stutters": 0,
+        "samples_with_pauses": 0,
+        "samples_with_fillers": 0,
+        "samples_with_stutters": 0,
+    }
     
     with torch.no_grad():
-        for audio_path, original_transcript in tqdm(matched, desc="Processing"):
+        for audio_path, transcript in tqdm(matched, desc="Processing"):
             try:
                 # Load audio
                 audio, sr = librosa.load(str(audio_path), sr=None, mono=True)
@@ -441,39 +456,22 @@ def main():
                 if duration < args.min_duration or duration > args.max_duration:
                     continue
                 
-                # Prepare transcript with pattern markers
-                prepared_text = prepare_training_text(
-                    original_transcript,
-                    audio,
-                    sr,
-                    detect_pauses=args.detect_pauses,
-                    audio_duration=duration,
-                )
-                
-                # Track stats
-                if any(m in prepared_text for m in ['[PAUSE]', '[LONG]', '[UH]', '[UM]', '...']):
-                    pattern_stats["with_markers"] += 1
-                
-                if args.detect_pauses:
-                    pauses = detect_pauses_in_audio(audio, sr)
-                    if pauses:
-                        pattern_stats["pauses_detected"] += 1
-                        pattern_stats["total_pauses"] += len(pauses)
+                # Normalize transcript
+                prepared_text = normalize_transcript(transcript)
                 
                 # Resample
                 audio_16k = librosa.resample(audio, orig_sr=sr, target_sr=16000)
                 audio_16k_tensor = torch.from_numpy(audio_16k).unsqueeze(0)
                 
-                # Tokenize with pattern markers
+                # Tokenize
                 text_tokens = tokenizer.tokenize(prepared_text)
                 text_ids = tokenizer.convert_tokens_to_ids(text_tokens)
                 text_ids_array = np.array(text_ids, dtype=np.int32)
                 
                 if len(text_ids) > max_text_tokens:
-                    warnings.warn(f"Skipping {audio_path.name}: text too long")
                     continue
                 
-                # Extract semantic features
+                # Extract semantic codes
                 inputs = extract_features(audio_16k_tensor, sampling_rate=16000, return_tensors="pt")
                 input_features = inputs["input_features"].to(device)
                 attention_mask = inputs["attention_mask"].to(device)
@@ -486,60 +484,99 @@ def main():
                 feat = vq_emb.hidden_states[17]
                 feat = (feat - semantic_mean) / semantic_std
                 
-                # Generate semantic codes
+                # Generate codes
                 codes, _ = semantic_codec.quantize(feat)
                 if codes.ndim == 2:
                     codes = codes[0]
-                codes = codes.cpu().numpy().astype(np.int32)
+                codes_np = codes.cpu().numpy().astype(np.int32)
                 
-                if codes.shape[0] > max_mel_tokens:
-                    warnings.warn(f"Skipping {audio_path.name}: codes too long")
+                if codes_np.shape[0] > max_mel_tokens:
                     continue
                 
-                # Get conditioning
-                cond_lengths = torch.tensor([feat.shape[1]], device=device)
-                conditioning_latent = gpt.get_conditioning(feat.transpose(1, 2), cond_lengths)
-                conditioning_latent = conditioning_latent.squeeze(0).cpu().numpy().astype(np.float32)
+                # === EXTRACT PATTERN FEATURES ===
+                pattern_features = analyzer.analyze_codes(codes_np, prepared_text, duration)
                 
-                emo_latent = gpt.get_emo_conditioning(feat.transpose(1, 2), cond_lengths)
-                emo_vec = gpt.emovec_layer(emo_latent)
-                emo_vec = gpt.emo_layer(emo_vec)
-                emo_vec = emo_vec.squeeze(0).cpu().numpy().astype(np.float32)
+                # Update stats
+                pattern_stats["total_pauses"] += pattern_features.num_pauses
+                pattern_stats["total_fillers"] += pattern_features.num_fillers
+                pattern_stats["total_stutters"] += pattern_features.num_stutters
+                if pattern_features.num_pauses > 0:
+                    pattern_stats["samples_with_pauses"] += 1
+                if pattern_features.num_fillers > 0:
+                    pattern_stats["samples_with_fillers"] += 1
+                if pattern_features.num_stutters > 0:
+                    pattern_stats["samples_with_stutters"] += 1
+                
+                # Extract conditioning (if not using global)
+                if global_condition is None:
+                    cond_lengths = torch.tensor([feat.shape[1]], device=device)
+                    gpt_cond = gpt.get_conditioning(feat.transpose(1, 2), cond_lengths)
+                    emo_cond = gpt.get_emo_conditioning(feat.transpose(1, 2), cond_lengths)
+                    emo_vec = gpt.emovec_layer(emo_cond)
+                    emo_vec = gpt.emo_layer(emo_vec)
+                    
+                    condition = gpt_cond.squeeze(0).cpu().numpy().astype(np.float32)
+                    emo_vec_np = emo_vec.squeeze(0).cpu().numpy().astype(np.float32)
+                else:
+                    condition = global_condition
+                    emo_vec_np = global_emo_vec
                 
                 # Save features
                 sample_id = audio_path.stem
                 np.save(features_dir / f"{sample_id}_text_ids.npy", text_ids_array)
-                np.save(features_dir / f"{sample_id}_codes.npy", codes)
-                np.save(features_dir / f"{sample_id}_condition.npy", conditioning_latent)
-                np.save(features_dir / f"{sample_id}_emo_vec.npy", emo_vec)
+                np.save(features_dir / f"{sample_id}_codes.npy", codes_np)
+                
+                # Save pattern features
+                pf_dict = asdict(pattern_features)
+                np.save(features_dir / f"{sample_id}_pattern_features.npy", pf_dict)
+                
+                # Determine condition path
+                if global_condition is not None:
+                    condition_path = "features/GLOBAL_condition.npy"
+                    emo_vec_path = "features/GLOBAL_emo_vec.npy"
+                else:
+                    np.save(features_dir / f"{sample_id}_condition.npy", condition)
+                    np.save(features_dir / f"{sample_id}_emo_vec.npy", emo_vec_np)
+                    condition_path = f"features/{sample_id}_condition.npy"
+                    emo_vec_path = f"features/{sample_id}_emo_vec.npy"
                 
                 manifest_entries.append({
                     "id": sample_id,
                     "text": prepared_text,
-                    "original_text": original_transcript,
                     "audio_path": str(audio_path),
                     "text_ids_path": f"features/{sample_id}_text_ids.npy",
                     "codes_path": f"features/{sample_id}_codes.npy",
-                    "condition_path": f"features/{sample_id}_condition.npy",
-                    "emo_vec_path": f"features/{sample_id}_emo_vec.npy",
+                    "condition_path": condition_path,
+                    "emo_vec_path": emo_vec_path,
+                    "pattern_features_path": f"features/{sample_id}_pattern_features.npy",
                     "text_len": len(text_ids),
-                    "code_len": codes.shape[0],
-                    "condition_len": conditioning_latent.shape[0],
+                    "code_len": codes_np.shape[0],
+                    "condition_len": condition.shape[0],
                     "duration": float(duration),
-                    "sample_type": "pattern",
+                    "sample_type": "pattern_v3",
+                    # Pattern summary in manifest
+                    "num_pauses": pattern_features.num_pauses,
+                    "num_fillers": pattern_features.num_fillers,
+                    "num_stutters": pattern_features.num_stutters,
+                    "speech_rate": pattern_features.speech_rate,
                 })
                 
             except Exception as e:
                 warnings.warn(f"Failed to process {audio_path.name}: {e}")
     
-    print(f"\nProcessed {len(manifest_entries)} samples")
-    print(f"\nPattern Statistics:")
-    print(f"  Samples with markers: {pattern_stats['with_markers']}")
-    if args.detect_pauses:
-        print(f"  Samples with detected pauses: {pattern_stats['pauses_detected']}")
-        print(f"  Total pauses detected: {pattern_stats['total_pauses']}")
+    print(f"  Processed {len(manifest_entries)} samples")
     
-    # Split and save manifests
+    # Pattern statistics
+    print(f"\n[4/5] Pattern statistics:")
+    print(f"  Total pauses detected: {pattern_stats['total_pauses']}")
+    print(f"  Total fillers detected: {pattern_stats['total_fillers']}")
+    print(f"  Total stutters detected: {pattern_stats['total_stutters']}")
+    print(f"  Samples with pauses: {pattern_stats['samples_with_pauses']}/{len(manifest_entries)}")
+    print(f"  Samples with fillers: {pattern_stats['samples_with_fillers']}/{len(manifest_entries)}")
+    print(f"  Samples with stutters: {pattern_stats['samples_with_stutters']}/{len(manifest_entries)}")
+    
+    # Split and save
+    print("\n[5/5] Saving manifests...")
     np.random.seed(42)
     indices = np.random.permutation(len(manifest_entries))
     split_idx = int(len(indices) * args.train_split)
@@ -547,47 +584,56 @@ def main():
     train_entries = [manifest_entries[i] for i in indices[:split_idx]]
     val_entries = [manifest_entries[i] for i in indices[split_idx:]]
     
-    train_manifest = args.output_dir / "train_manifest.jsonl"
-    val_manifest = args.output_dir / "val_manifest.jsonl"
+    train_path = output_dir / "train_manifest.jsonl"
+    val_path = output_dir / "val_manifest.jsonl"
     
-    with open(train_manifest, "w", encoding="utf-8") as f:
+    with open(train_path, "w") as f:
         for entry in train_entries:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     
-    with open(val_manifest, "w", encoding="utf-8") as f:
+    with open(val_path, "w") as f:
         for entry in val_entries:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     
-    print(f"\nSaved manifests:")
-    print(f"  Train: {train_manifest} ({len(train_entries)} samples)")
-    print(f"  Val: {val_manifest} ({len(val_entries)} samples)")
+    # Save dataset info
+    info = {
+        "version": "v3_pattern_features",
+        "total_samples": len(manifest_entries),
+        "train_samples": len(train_entries),
+        "val_samples": len(val_entries),
+        "uses_global_conditioning": global_condition is not None,
+        "pattern_stats": pattern_stats,
+    }
+    with open(output_dir / "dataset_info.json", "w") as f:
+        json.dump(info, f, indent=2)
     
-    print("\n" + "="*60)
-    print("NEXT STEPS FOR PATTERN TRAINING")
-    print("="*60)
-    print("""
-1. Train with higher LoRA rank for pattern capacity:
-   python tools/train_gpt_lora.py \\
-       --train-manifest {train} \\
-       --val-manifest {val} \\
-       --lora-rank 32 \\
-       --lora-alpha 64 \\
-       --epochs 30 \\
-       --learning-rate 5e-4 \\
-       --output-dir training/goldblum/lora
+    print(f"\n  Train: {train_path} ({len(train_entries)} samples)")
+    print(f"  Val: {val_path} ({len(val_entries)} samples)")
+    
+    print("\n" + "=" * 60)
+    print("DATASET PREPARATION COMPLETE")
+    print("=" * 60)
+    print(f"""
+This dataset includes PATTERN FEATURES for each sample, enabling:
+  - Pattern-aware loss during training
+  - Explicit pause/stutter detection
+  - Speech rate analysis
 
-2. Extract speaker embeddings from training audio:
-   python tools/extract_embeddings.py --speaker goldblum
+NEXT STEPS:
+===========
+Train with pattern embeddings:
 
-3. Test with the trained speaker's embeddings:
-   python tools/infer.py --speaker goldblum \\
-       --lora-path training/goldblum/lora/final_checkpoint \\
-       --text "Life finds a way"
+    python tools/train_pattern_embeddings.py \\
+        --speaker {args.speaker or 'SPEAKER'} \\
+        --epochs 40 \\
+        --pattern-tokens 8
 
-IMPORTANT: The model learns patterns from the conditioning!
-Using different reference audio at inference will lose the patterns.
-Always use embeddings from the training audio for pattern reproduction.
-""".format(train=train_manifest, val=val_manifest))
+Then run inference with patterns:
+
+    python tools/infer_with_patterns.py \\
+        --speaker {args.speaker or 'SPEAKER'} \\
+        --text "Your text here"
+""")
 
 
 if __name__ == "__main__":

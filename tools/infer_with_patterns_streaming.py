@@ -424,7 +424,6 @@ def pattern_aware_inference_streaming(
     Yields:
         Audio chunks as torch.Tensor (1, samples) at 22050 Hz
     """
-    from indextts.streaming import streaming_inference, StreamingConfig
     from indextts.streaming_v2 import streaming_inference_v2, StreamingConfigV2, StreamingMode, get_fast_streaming_config, get_balanced_streaming_config
     
     # StreamingConfigV2(

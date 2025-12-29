@@ -66,7 +66,7 @@ import time
 from pathlib import Path
 from typing import Optional
 import re
-from .infer_with_patterns_streaming import pattern_aware_inference_streaming
+from tools.infer_with_patterns_streaming import pattern_aware_inference_streaming
 
 import torch
 import torchaudio

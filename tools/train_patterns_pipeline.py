@@ -214,7 +214,7 @@ LoRA rank: {args.lora_rank if not args.no_lora else 'DISABLED'}
             print(f"✓ Using existing: {train_manifest}")
         else:
             cmd = [
-                sys.executable, str(PROJECT_ROOT / "tools" / "prepare_pattern_dataset_v3.py"),
+                sys.executable, str(PROJECT_ROOT / "tools" / "prepare_pattern_dataset.py"),
                 "--speaker", args.speaker,
             ]
             if pattern_cond_path.exists():
