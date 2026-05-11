@@ -111,36 +111,19 @@ def apply_lora_to_model(
     include_gpt: bool = True,
     bias: str = "none",
 ) -> PeftModel:
-    """
-    Apply LoRA adapters to a UnifiedVoice model.
+    """Apply LoRA adapters to a UnifiedVoice model."""
     
-    Args:
-        model: The base UnifiedVoice model to adapt
-        lora_rank: Rank of the LoRA decomposition (higher = more capacity, slower)
-        lora_alpha: Scaling factor for LoRA weights (usually 2*rank)
-        lora_dropout: Dropout probability for LoRA layers
-        target_modules: Custom list of modules to target (overrides defaults)
-        include_embeddings: Whether to include embedding layers
-        include_heads: Whether to include output heads
-        include_conditioning: Whether to include conditioning/voice encoders (recommended for voice cloning!)
-        include_gpt: Whether to include GPT transformer layers (CRITICAL for voice generation!)
-        bias: Bias training strategy: "none", "all", or "lora_only"
-    
-    Returns:
-        The model wrapped with PEFT LoRA adapters
-        
-    Raises:
-        ValueError: If no LoRA adapters were successfully applied
-    """
     if target_modules is None:
-        target_modules = get_lora_target_modules(
-            include_embeddings=include_embeddings,
-            include_heads=include_heads,
-            include_conditioning=include_conditioning,
-            include_gpt=include_gpt,
-        )
-    
-    # Show what modules we're targeting
+        target_modules = [
+            # Transformer block layers (The 24 layers)
+            "c_attn", "c_proj", "c_fc", "w_1", "w_2", 
+            # Attention specific
+            "linear_q", "linear_k", "linear_v", "linear_out",
+            # Heads (Important for verbatim)
+            "text_head", "mel_head",
+            # Conditioning
+            "emovec_layer", "emo_layer"
+        ]
     print(f"[LoRA] Target modules: {target_modules}")
     
     # Find which target modules actually exist in the model
@@ -184,22 +167,158 @@ def apply_lora_to_model(
     
     print(f"[LoRA] Successfully created {lora_a_count} LoRA adapter pairs")
     
-    # Check for GPT layers specifically (critical for voice)
-    gpt_lora = [n for n in lora_params if 'gpt.h.' in n]
-    if include_gpt and not gpt_lora:
-        warnings.warn(
-            "WARNING: No GPT transformer layers were adapted by LoRA! "
-            "Voice generation may not be affected. "
-            "Check that target_modules includes 'c_attn', 'c_proj', 'c_fc'."
-        )
-    elif gpt_lora:
-        gpt_layers = set(n.split('.')[3] for n in gpt_lora if 'gpt.h.' in n)
-        print(f"[LoRA] GPT layers with LoRA adapters: {len(gpt_layers)} transformer layers")
+    # FIXED: Better GPT layer counting
+    if include_gpt:
+        gpt_lora = [n for n in lora_params if 'gpt' in n.lower() and '.h.' in n]
+        if not gpt_lora:
+            warnings.warn(
+                "WARNING: No GPT transformer layers were adapted by LoRA! "
+                "Voice generation may not be affected. "
+                "Check that target_modules includes 'c_attn', 'c_proj', 'c_fc'."
+            )
+        else:
+            # Extract layer numbers more robustly
+            gpt_layers = set()
+            for name in gpt_lora:
+                # Look for pattern like "gpt.h.0." or "gpt.h.23."
+                import re
+                match = re.search(r'\.h\.(\d+)\.', name)
+                if match:
+                    gpt_layers.add(int(match.group(1)))
+            
+            print(f"[LoRA] GPT layers with LoRA adapters: {len(gpt_layers)}/24 transformer layers")
+            print(f"[LoRA] Adapted layers: {sorted(gpt_layers)}")
+            
+            if len(gpt_layers) < 24:
+                warnings.warn(
+                    f"WARNING: Only {len(gpt_layers)}/24 GPT layers have LoRA adapters! "
+                    f"This may significantly limit fine-tuning effectiveness. "
+                    f"Expected all 24 layers to be adapted."
+                )
     
     # Print trainable parameters info
     peft_model.print_trainable_parameters()
     
     return peft_model
+
+# def apply_lora_to_model(
+#     model: torch.nn.Module,
+#     lora_rank: int = 8,
+#     lora_alpha: int = 16,
+#     lora_dropout: float = 0.05,
+#     target_modules: Optional[List[str]] = None,
+#     include_embeddings: bool = False,
+#     include_heads: bool = True,
+#     include_conditioning: bool = True,
+#     include_gpt: bool = True,
+#     bias: str = "none",
+# ) -> PeftModel:
+#     """
+#     Apply LoRA adapters to a UnifiedVoice model.
+    
+#     Args:
+#         model: The base UnifiedVoice model to adapt
+#         lora_rank: Rank of the LoRA decomposition (higher = more capacity, slower)
+#         lora_alpha: Scaling factor for LoRA weights (usually 2*rank)
+#         lora_dropout: Dropout probability for LoRA layers
+#         target_modules: Custom list of modules to target (overrides defaults)
+#         include_embeddings: Whether to include embedding layers
+#         include_heads: Whether to include output heads
+#         include_conditioning: Whether to include conditioning/voice encoders (recommended for voice cloning!)
+#         include_gpt: Whether to include GPT transformer layers (CRITICAL for voice generation!)
+#         bias: Bias training strategy: "none", "all", or "lora_only"
+    
+#     Returns:
+#         The model wrapped with PEFT LoRA adapters
+        
+#     Raises:
+#         ValueError: If no LoRA adapters were successfully applied
+#     """
+#     if target_modules is None:
+#         target_modules = get_lora_target_modules(
+#             include_embeddings=include_embeddings,
+#             include_heads=include_heads,
+#             include_conditioning=include_conditioning,
+#             include_gpt=include_gpt,
+#         )
+#     target_modules = [
+#         # Transformer block layers (The 24 layers)
+#         "c_attn", "c_proj", "c_fc", "w_1", "w_2", 
+#         # Attention specific
+#         "linear_q", "linear_k", "linear_v", "linear_out",
+#         # Heads (Important for verbatim)
+#         "text_head", "mel_head",
+#         # Conditioning
+#         "emovec_layer", "emo_layer"
+#     ]
+#     # Show what modules we're targeting
+#     print(f"[LoRA] Target modules: {target_modules}")
+    
+#     # Find which target modules actually exist in the model
+#     model_modules = {name.split('.')[-1] for name, _ in model.named_modules()}
+#     matched = [m for m in target_modules if m in model_modules]
+#     unmatched = [m for m in target_modules if m not in model_modules]
+    
+#     if unmatched:
+#         print(f"[LoRA] Warning: These target modules were not found in model: {unmatched}")
+    
+#     if not matched:
+#         raise ValueError(
+#             f"No target modules matched! Targets: {target_modules}\n"
+#             f"Available module names (last part): {sorted(model_modules)[:50]}..."
+#         )
+    
+#     print(f"[LoRA] Matched target modules: {matched}")
+    
+#     lora_config = LoraConfig(
+#         r=lora_rank,
+#         lora_alpha=lora_alpha,
+#         target_modules=target_modules,
+#         lora_dropout=lora_dropout,
+#         bias=bias,
+#         task_type=TaskType.CAUSAL_LM,
+#     )
+    
+#     peft_model = get_peft_model(model, lora_config)
+#     # print(">>> Unlocking heads and LoRA parameters...")
+#     # for name, param in peft_model.named_parameters():
+#     #     # We explicitly allow 'head', 'proj', and 'lora' parameters to update
+#     #     if any(k in name for k in ["head", "lora", "emovec", "emo_layer"]):
+#     #         param.requires_grad = True
+
+#     # # 3. Double check (Optional but recommended)
+#     # trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+#     # print(f">>> Total trainable parameters: {trainable_params:,}")
+#     # Validate that LoRA was actually applied
+#     lora_params = [n for n, _ in peft_model.named_parameters() if 'lora_' in n.lower()]
+#     if not lora_params:
+#         raise ValueError(
+#             "No LoRA parameters were created! PEFT may not have matched any modules. "
+#             f"Target modules were: {target_modules}"
+#         )
+    
+#     # Count LoRA layers
+#     lora_a_count = sum(1 for n in lora_params if 'lora_a' in n.lower() or 'lora_A' in n)
+#     lora_b_count = sum(1 for n in lora_params if 'lora_b' in n.lower() or 'lora_B' in n)
+    
+#     print(f"[LoRA] Successfully created {lora_a_count} LoRA adapter pairs")
+    
+#     # Check for GPT layers specifically (critical for voice)
+#     gpt_lora = [n for n in lora_params if 'gpt.h.' in n]
+#     if include_gpt and not gpt_lora:
+#         warnings.warn(
+#             "WARNING: No GPT transformer layers were adapted by LoRA! "
+#             "Voice generation may not be affected. "
+#             "Check that target_modules includes 'c_attn', 'c_proj', 'c_fc'."
+#         )
+#     elif gpt_lora:
+#         gpt_layers = set(n.split('.')[3] for n in gpt_lora if 'gpt.h.' in n)
+#         print(f"[LoRA] GPT layers with LoRA adapters: {len(gpt_layers)} transformer layers")
+    
+#     # Print trainable parameters info
+#     peft_model.print_trainable_parameters()
+    
+#     return peft_model
 
 
 def save_lora_checkpoint(
@@ -277,6 +396,30 @@ def load_lora_checkpoint(
         device_map=device,
     )
     
+    # with torch.no_grad():
+    #     # Pick a specific layer usually targeted by LoRA, e.g., an attention projection
+    #     sample_layer = None
+    #     for name, module in base_model.named_modules():
+    #         if "c_attn" in name or "q_proj" in name: # Adjust based on your model arch
+    #             sample_layer = module
+    #             break
+        
+    #     if sample_layer:
+    #         w_before = sample_layer.weight.norm().item()
+    #         print(f"DEBUG: Weight norm before merge: {w_before:.4f}")
+
+    # if merge_weights:
+    #     print("Merging LoRA weights into base model...")
+    #     peft_model = peft_model.merge_and_unload()
+        
+    #     # DEBUG: Print weight norm after merging
+    #     if sample_layer:
+    #         w_after = sample_layer.weight.norm().item()
+    #         print(f"DEBUG: Weight norm after merge:  {w_after:.4f}")
+    #         print(f"DEBUG: Difference: {abs(w_after - w_before):.6f}")
+            
+    #         if abs(w_after - w_before) < 1e-5:
+    #             print(">> WARNING: LoRA weights seem to be empty or effectively zero!")
     if merge_weights:
         print("Merging LoRA weights into base model...")
         peft_model = peft_model.merge_and_unload()
@@ -290,7 +433,7 @@ def load_lora_checkpoint(
         with open(metadata_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
         print(f"Training metadata loaded: {metadata.get('epochs', 'N/A')} epochs, "
-              f"{metadata.get('final_loss', 'N/A')} final loss")
+              f"{metadata.get('final_loss', 'N/A')} final loss")    
     
     return peft_model
 

@@ -92,6 +92,18 @@ def parse_args():
     parser.add_argument("--train-manifest", type=Path, help="Custom train manifest")
     parser.add_argument("--val-manifest", type=Path, help="Custom val manifest")
     
+    # Speaker embeddings options (IMPORTANT for consistent training/inference)
+    parser.add_argument("--speaker-embeddings", type=Path,
+                        help="Pre-computed speaker embeddings to use for ALL samples")
+    parser.add_argument("--extract-speaker-embeddings", action="store_true", default=True,
+                        help="Extract speaker embeddings before training (RECOMMENDED)")
+    parser.add_argument("--embedding-mode", choices=["single", "averaged"], default="single",
+                        help="Use 'single' (recommended - preserves patterns) or 'averaged' embeddings")
+    parser.add_argument("--reference-sample", type=Path,
+                        help="Specific audio file to use as reference for embeddings (default: auto-select with most stutters)")
+    parser.add_argument("--num-samples-for-averaging", type=int, default=10,
+                        help="Number of samples to average (only used if --embedding-mode=averaged)")
+    
     # LoRA config
     parser.add_argument("--lora-rank", type=int, default=16,
                         help="LoRA rank (default: 16)")
@@ -160,12 +172,18 @@ class VerbatimSample:
 
 
 class VerbatimDataset(Dataset):
-    """Dataset for verbatim training."""
+    """Dataset for verbatim training.
     
-    def __init__(self, manifest_path: Path):
+    If global_condition is provided, uses it for ALL samples instead of per-sample conditioning.
+    This ensures training uses the SAME conditioning that will be used at inference!
+    """
+    
+    def __init__(self, manifest_path: Path, global_condition: torch.Tensor = None, global_emo_vec: torch.Tensor = None):
         self.manifest_path = manifest_path
         self.base_dir = manifest_path.parent
         self.samples: List[VerbatimSample] = []
+        self.global_condition = global_condition  # Shape: (32, 1280) - same for all samples
+        self.global_emo_vec = global_emo_vec      # Shape: (1, 1280)
         self._load_manifest()
     
     def _resolve_path(self, value: str) -> Path:
@@ -210,15 +228,28 @@ class VerbatimDataset(Dataset):
         
         text_ids = np.load(sample.text_ids_path, allow_pickle=False).astype(np.int64)
         codes = np.load(sample.codes_path, allow_pickle=False).astype(np.int64)
-        condition = np.load(sample.condition_path, allow_pickle=False).astype(np.float32)
-        emo_vec = np.load(sample.emo_vec_path, allow_pickle=False).astype(np.float32)
+        
+        # Use global conditioning if available (RECOMMENDED for consistent training/inference)
+        if self.global_condition is not None:
+            condition = self.global_condition.clone()
+        else:
+            condition = torch.from_numpy(
+                np.load(sample.condition_path, allow_pickle=False).astype(np.float32)
+            )
+        
+        if self.global_emo_vec is not None:
+            emo_vec = self.global_emo_vec.clone()
+        else:
+            emo_vec = torch.from_numpy(
+                np.load(sample.emo_vec_path, allow_pickle=False).astype(np.float32)
+            )
         
         return {
             "id": sample.id,
             "text_ids": torch.from_numpy(text_ids),
             "codes": torch.from_numpy(codes),
-            "condition": torch.from_numpy(condition),
-            "emo_vec": torch.from_numpy(emo_vec),
+            "condition": condition,
+            "emo_vec": emo_vec,
             "text_len": torch.tensor(sample.text_len, dtype=torch.long),
             "code_len": torch.tensor(sample.code_len, dtype=torch.long),
             "condition_len": torch.tensor(sample.condition_len, dtype=torch.long),
@@ -470,6 +501,179 @@ def evaluate(
     return {k: v / max(count, 1) for k, v in totals.items()}
 
 
+def extract_single_sample_features(
+    audio_path: str,
+    device: torch.device,
+    verbose: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Extract speaker features from a SINGLE audio sample.
+    
+    IMPORTANT: Using a single sample preserves the temporal dynamics and patterns
+    (stutters, pauses, etc.) better than averaging multiple samples!
+    
+    Returns:
+        Dict containing:
+            - spk_cond_emb: (1, T, 1024) - W2V-BERT features
+            - emo_cond_emb: (1, T, 1024) - Emotion W2V-BERT features
+            - style: (1, 192) - CAMPPlus style vector
+            - ref_mel: (1, 128, T') - Reference mel spectrogram
+            - prompt_condition: (1, T'', 768) - S2Mel prompt conditioning
+    """
+    from indextts.infer_v2 import IndexTTS2
+    from indextts.speaker_embeddings import SpeakerEmbeddingStore
+    
+    if verbose:
+        print(f"\n[SINGLE SAMPLE FEATURES] Extracting from: {Path(audio_path).name}")
+        print("  Using SINGLE sample preserves patterns (stutters, pauses)!")
+    
+    # Load TTS model for feature extraction
+    tts = IndexTTS2(use_fp16=False)
+    
+    # Use SpeakerEmbeddingStore to extract from single sample
+    store = SpeakerEmbeddingStore(tts)
+    speaker_embeddings = store.extract_embeddings(audio_path)
+    
+    # Clean up TTS model to free memory
+    del tts
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    if verbose:
+        print(f"\n  ✓ Features extracted from single sample!")
+        for key, value in speaker_embeddings.items():
+            print(f"    {key}: {value}")
+    
+    return speaker_embeddings
+
+
+def extract_averaged_features(
+    audio_paths: List[str],
+    device: torch.device,
+    num_samples: int = 10,
+    verbose: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Extract averaged speaker features from multiple audio samples.
+    
+    NOTE: Averaging can dilute temporal patterns (stutters, pauses).
+    Use extract_single_sample_features() for better pattern preservation!
+    
+    Returns:
+        Dict containing speaker embeddings
+    """
+    from indextts.infer_v2 import IndexTTS2
+    from indextts.speaker_embeddings import SpeakerEmbeddingStore
+    
+    if verbose:
+        print(f"\n[AVERAGED FEATURES] Extracting from {min(len(audio_paths), num_samples)} samples...")
+        print("  Note: Averaging may dilute stutter/pause patterns!")
+    
+    # Sample audio files
+    if len(audio_paths) > num_samples:
+        sample_indices = random.sample(range(len(audio_paths)), num_samples)
+        sampled_paths = [audio_paths[i] for i in sample_indices]
+    else:
+        sampled_paths = audio_paths
+    
+    # Load TTS model for feature extraction
+    tts = IndexTTS2(use_fp16=False)
+    
+    # Use SpeakerEmbeddingStore to extract averaged embeddings
+    store = SpeakerEmbeddingStore(tts)
+    speaker_embeddings = store.extract_averaged_embeddings(sampled_paths, verbose=verbose)
+    
+    # Clean up TTS model to free memory
+    del tts
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    if verbose:
+        print(f"\n  ✓ Averaged features extracted!")
+        for key, value in speaker_embeddings.items():
+            print(f"    {key}: {value.shape}")
+    
+    return speaker_embeddings
+
+
+def select_best_reference_sample(
+    manifest_path: Path,
+    verbose: bool = True,
+) -> Optional[str]:
+    """
+    Select the best reference sample - preferring samples with stutters/patterns.
+    
+    Selection criteria:
+    1. Has stutters (repetitions/fillers)
+    2. Moderate duration (3-10 seconds)
+    3. Audio file exists
+    """
+    best_sample = None
+    best_score = -1
+    all_samples = []
+    
+    with open(manifest_path, "r") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            audio_path = entry.get("audio_path")
+            
+            if not audio_path or not Path(audio_path).exists():
+                continue
+            
+            all_samples.append(entry)
+            
+            # Score based on stutter features
+            score = 0
+            if entry.get("has_repetitions"):
+                score += 3
+            if entry.get("has_fillers"):
+                score += 2
+            if entry.get("has_hesitations"):
+                score += 1
+            
+            # Add repetition/filler counts
+            score += entry.get("repetition_count", 0) * 0.5
+            score += entry.get("filler_count", 0) * 0.3
+            
+            # Prefer moderate duration (3-10s)
+            duration = entry.get("duration", 5.0)
+            if 3.0 <= duration <= 10.0:
+                score += 1
+            
+            if score > best_score:
+                best_score = score
+                best_sample = audio_path
+    
+    if verbose:
+        if best_sample:
+            print(f"\n  Selected reference sample: {Path(best_sample).name}")
+            print(f"  Score: {best_score:.1f} (higher = more stutters)")
+        else:
+            print("  No suitable reference sample found!")
+            
+    return best_sample
+
+
+def save_global_features(
+    speaker_embeddings: Dict[str, torch.Tensor],
+    output_path: Path,
+):
+    """Save global speaker features for training and inference."""
+    from indextts.speaker_embeddings import SpeakerEmbeddingStore
+    store = SpeakerEmbeddingStore()
+    store.save_embeddings(speaker_embeddings, output_path)
+    print(f"  Saved global features to: {output_path}")
+
+
+def load_global_features(path: Path) -> Dict[str, torch.Tensor]:
+    """Load previously saved global speaker features."""
+    from indextts.speaker_embeddings import SpeakerEmbeddingStore
+    store = SpeakerEmbeddingStore()
+    return store.load_embeddings(path)
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -529,12 +733,136 @@ Train manifest: {train_manifest}
 Output: {output_dir}
 """)
     
+    # ================================================================
+    # STEP 0: EXTRACT GLOBAL SPEAKER FEATURES (CRITICAL!)
+    # ================================================================
+    # This ensures training and inference use the SAME conditioning!
+    # We store speaker embeddings (including spk_cond_emb) which will be used
+    # BOTH for training AND at inference time.
+    # ================================================================
+    
+    global_speaker_embeddings = None
+    speaker_emb_path = output_dir / "speaker_embeddings.pt"
+    
+    # Get audio paths from manifest first
+    audio_paths = []
+    with open(train_manifest, "r") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            audio_path = entry.get("audio_path")
+            if audio_path and Path(audio_path).exists():
+                audio_paths.append(audio_path)
+    
+    if args.speaker_embeddings and args.speaker_embeddings.exists():
+        # Use pre-computed speaker embeddings
+        print("\n[0/5] Loading pre-computed speaker embeddings...")
+        global_speaker_embeddings = load_global_features(args.speaker_embeddings)
+        print(f"  ✓ Loaded from: {args.speaker_embeddings}")
+        
+    elif args.extract_speaker_embeddings and audio_paths:
+        # Extract speaker embeddings from audio files
+        print("\n[0/5] Extracting speaker embeddings...")
+        print("  This ensures SAME features for training AND inference!")
+        
+        if args.embedding_mode == "single":
+            # SINGLE SAMPLE MODE (RECOMMENDED for pattern preservation)
+            print(f"\n  Mode: SINGLE SAMPLE (preserves stutters/patterns!)")
+            
+            # Determine which sample to use as reference
+            if args.reference_sample and args.reference_sample.exists():
+                reference_audio = str(args.reference_sample)
+                print(f"  Using specified reference: {args.reference_sample.name}")
+            else:
+                # Auto-select best sample (one with most stutters)
+                print("  Auto-selecting reference sample with most patterns...")
+                reference_audio = select_best_reference_sample(train_manifest, verbose=True)
+                
+                if not reference_audio:
+                    # Fallback to first audio file
+                    reference_audio = audio_paths[0] if audio_paths else None
+                    print(f"  Fallback: Using first audio file")
+            
+            if reference_audio:
+                global_speaker_embeddings = extract_single_sample_features(
+                    reference_audio,
+                    device,
+                    verbose=True,
+                )
+            else:
+                print("  ❌ No audio files available for embedding extraction!")
+        else:
+            # AVERAGED MODE (may dilute patterns)
+            print(f"\n  Mode: AVERAGED ({args.num_samples_for_averaging} samples)")
+            print("  ⚠ Note: Averaging may dilute stutter patterns!")
+            
+            global_speaker_embeddings = extract_averaged_features(
+                audio_paths,
+                device,
+                num_samples=args.num_samples_for_averaging,
+                verbose=True,
+            )
+        
+        # Save for later use (this is the SAME file used at inference!)
+        if global_speaker_embeddings:
+            save_global_features(global_speaker_embeddings, speaker_emb_path)
+    
+    if global_speaker_embeddings is not None:
+        print(f"\n  USING SPEAKER EMBEDDINGS ({args.embedding_mode.upper()} mode):")
+        print(f"    - Same embeddings for ALL {len(audio_paths)} training samples")
+        print(f"    - Same embeddings will be used at inference!")
+        print(f"    - This ensures LoRA adaptations aren't overshadowed")
+        if args.embedding_mode == "single":
+            print(f"    - SINGLE mode preserves stutters/pauses in embeddings!")
+    else:
+        print(f"\n  ⚠ WARNING: Using per-sample conditioning")
+        print(f"    This may cause training/inference mismatch!")
+        print(f"    Consider using --extract-speaker-embeddings (default)")
+    
     # Load base model
-    print("\n[1/3] Loading base model...")
+    print("\n[1/5] Loading base model...")
     model = build_model(args.config, args.base_checkpoint, device)
     
+    # ================================================================
+    # Compute global conditioning from speaker embeddings
+    # ================================================================
+    global_condition = None
+    global_emo_vec = None
+    
+    if global_speaker_embeddings is not None:
+        print("  Computing GPT conditioning from global speaker embeddings...")
+        
+        with torch.no_grad():
+            # Get spk_cond_emb (W2V-BERT features) from speaker embeddings
+            spk_cond_emb = global_speaker_embeddings['spk_cond_emb'].to(device)  # (1, T, 1024)
+            emo_cond_emb = global_speaker_embeddings.get('emo_cond_emb', spk_cond_emb).to(device)
+            
+            # Compute conditioning using the same path as inference!
+            # This is the key to ensuring training matches inference
+            cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
+            emo_cond_lengths = torch.tensor([emo_cond_emb.shape[1]], device=device)
+            
+            # Get the conditioning (same as inference path)
+            global_condition = model.get_conditioning(
+                spk_cond_emb.transpose(1, 2),  # (1, 1024, T)
+                cond_lengths
+            ).squeeze(0)  # (32, model_dim)
+            
+            # Get emotion vector (same as inference path)
+            emo_cond = model.get_emo_conditioning(
+                emo_cond_emb.transpose(1, 2),  # (1, 1024, T)
+                emo_cond_lengths
+            )
+            global_emo_vec = model.emovec_layer(emo_cond)
+            global_emo_vec = model.emo_layer(global_emo_vec).squeeze(0)  # (1, model_dim)
+        
+        print(f"  ✓ Global conditioning computed:")
+        print(f"    condition: {global_condition.shape}")
+        print(f"    emo_vec: {global_emo_vec.shape}")
+    
     # Apply LoRA (PEFT handles freezing base model automatically)
-    print("\n[2/3] Applying LoRA adapters...")
+    print("\n[2/5] Applying LoRA adapters...")
     model = apply_lora_to_model(
         model,
         lora_rank=args.lora_rank,
@@ -544,6 +872,15 @@ Output: {output_dir}
         include_conditioning=args.include_conditioning,
         include_heads=args.include_heads,
     )
+
+    
+    print(">>> Unlocking heads and LoRA parameters...")
+    for name, param in model.named_parameters():
+        if any(k in name for k in ["head", "lora", "emovec", "emo_layer"]):
+            param.requires_grad = True
+
+    # trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # print(f">>> Total trainable parameters: {trainable_params:,}")
     
     # CRITICAL: Enable input gradients for gradient checkpointing to work with LoRA
     # Since UnifiedVoice doesn't have enable_input_require_grads(), we implement it manually
@@ -562,10 +899,24 @@ Output: {output_dir}
     total = param_stats["all_params"]
     print(f"  Trainable: {trainable:,} / {total:,} ({param_stats['trainable_percentage']:.2f}%)")
     
-    # Load datasets
-    print("\n[3/3] Loading datasets...")
-    train_dataset = VerbatimDataset(train_manifest)
-    val_dataset = VerbatimDataset(val_manifest) if val_manifest and val_manifest.exists() else None
+    # Load datasets WITH global conditioning
+    print("\n[3/5] Loading datasets...")
+    train_dataset = VerbatimDataset(
+        train_manifest,
+        global_condition=global_condition.cpu() if global_condition is not None else None,
+        global_emo_vec=global_emo_vec.cpu() if global_emo_vec is not None else None,
+    )
+    val_dataset = VerbatimDataset(
+        val_manifest,
+        global_condition=global_condition.cpu() if global_condition is not None else None,
+        global_emo_vec=global_emo_vec.cpu() if global_emo_vec is not None else None,
+    ) if val_manifest and val_manifest.exists() else None
+    
+    if global_condition is not None:
+        print(f"  ✓ Using GLOBAL conditioning for all {len(train_dataset)} samples")
+        print(f"    This MATCHES what will be used at inference!")
+    else:
+        print(f"  ⚠ Using per-sample conditioning (training/inference may mismatch)")
     
     train_loader = DataLoader(
         train_dataset,
@@ -593,12 +944,26 @@ Output: {output_dir}
         weight_decay=0.01,
     )
     
-    # Scheduler
-    total_steps = args.epochs * len(train_loader) // args.grad_accumulation
+    # Calculate total steps - ensure at least 1 step per epoch!
+    batches_per_epoch = len(train_loader)
+    effective_grad_accum = min(args.grad_accumulation, batches_per_epoch)  # Can't accumulate more than we have
+    steps_per_epoch = max(1, batches_per_epoch // effective_grad_accum)
+    total_steps = args.epochs * steps_per_epoch
+    
+    # Warmup should be ~10% of total steps, not a fixed number
+    warmup_steps = min(args.warmup_steps, max(1, total_steps // 10))
+    
+    print(f"\n  Training schedule:")
+    print(f"    Batches per epoch: {batches_per_epoch}")
+    print(f"    Effective grad accumulation: {effective_grad_accum}")
+    print(f"    Steps per epoch: {steps_per_epoch}")
+    print(f"    Total steps: {total_steps}")
+    print(f"    Warmup steps: {warmup_steps}")
+    
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=total_steps,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max(total_steps, 1),  # Ensure at least 1
     )
     
     # AMP
@@ -620,6 +985,7 @@ Output: {output_dir}
         epoch_stutter_samples = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        accumulated_batches = 0
         
         for batch_idx, batch in enumerate(pbar):
             with torch.amp.autocast('cuda', enabled=use_amp):
@@ -629,7 +995,7 @@ Output: {output_dir}
                     stutter_weight=args.stutter_weight,
                 )
             
-            scaled_loss = loss / args.grad_accumulation
+            scaled_loss = loss / effective_grad_accum
             
             if use_amp:
                 scaler.scale(scaled_loss).backward()
@@ -640,12 +1006,19 @@ Output: {output_dir}
             epoch_loss += loss.item() * bsz
             epoch_samples += bsz
             epoch_stutter_samples += metrics["stutter_samples"]
+            accumulated_batches += 1
             
-            if (batch_idx + 1) % args.grad_accumulation == 0:
+            # Do optimizer step when we've accumulated enough OR at end of epoch
+            is_accumulation_step = accumulated_batches >= effective_grad_accum
+            is_last_batch = (batch_idx + 1) == len(train_loader)
+            
+            if is_accumulation_step or is_last_batch:
                 if args.grad_clip > 0:
                     if use_amp:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
                 
                 if use_amp:
                     scaler.step(optimizer)
@@ -655,26 +1028,36 @@ Output: {output_dir}
                 
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                accumulated_batches = 0
                 
                 global_step += 1
                 
-                # Logging
-                if global_step % args.log_interval == 0:
-                    writer.add_scalar("train/loss", metrics["mel_loss"], global_step)
-                    writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
-                    writer.add_scalar("train/mel_top10", metrics["mel_top10"], global_step)
-                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+                # Log learning rate and gradient norm
+                current_lr = scheduler.get_last_lr()[0]
+                
+                # Logging to tensorboard
+                writer.add_scalar("train/loss", metrics["mel_loss"], global_step)
+                writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
+                writer.add_scalar("train/mel_top10", metrics["mel_top10"], global_step)
+                writer.add_scalar("train/lr", current_lr, global_step)
+                writer.add_scalar("train/grad_norm", grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm, global_step)
                 
                 pbar.set_postfix({
                     "loss": f"{metrics['mel_loss']:.4f}",
                     "top1": f"{metrics['mel_top1']:.3f}",
-                    "top10": f"{metrics['mel_top10']:.3f}",
+                    "lr": f"{current_lr:.2e}",
+                    "grad": f"{grad_norm:.2f}" if isinstance(grad_norm, torch.Tensor) else f"{grad_norm:.2f}",
                 })
                 
                 # Checkpoint
                 if global_step % args.save_interval == 0:
                     ckpt_dir = output_dir / f"checkpoint_step{global_step}"
                     save_lora_checkpoint(model, ckpt_dir, {"step": global_step})
+            else:
+                pbar.set_postfix({
+                    "loss": f"{metrics['mel_loss']:.4f}",
+                    "accum": f"{accumulated_batches}/{effective_grad_accum}",
+                })
         
         # End of epoch
         avg_train_loss = epoch_loss / max(epoch_samples, 1)
@@ -696,7 +1079,7 @@ Output: {output_dir}
             if val_metrics["mel_loss"] < best_val_loss:
                 best_val_loss = val_metrics["mel_loss"]
                 
-                best_dir = output_dir / "best_checkpoint"
+                best_dir = output_dir / "best_checkpoint/lora"
                 save_lora_checkpoint(model, best_dir, {
                     "epoch": epoch,
                     "val_loss": best_val_loss,
@@ -705,7 +1088,7 @@ Output: {output_dir}
                 print(f"  ✓ New best model saved (val_loss={best_val_loss:.4f})")
     
     # Save final checkpoint
-    final_dir = output_dir / "final_checkpoint"
+    final_dir = output_dir / "final_checkpoint/lora"
     save_lora_checkpoint(model, final_dir, {
         "epochs": args.epochs,
         "final_val_loss": val_metrics["mel_loss"] if val_loader else avg_train_loss,
@@ -716,42 +1099,110 @@ Output: {output_dir}
     
     writer.close()
     
+    # ============================================================
+    # STEP 4: SAVE SPEAKER EMBEDDINGS FOR INFERENCE
+    # ============================================================
+    print("\n[4/5] Saving speaker embeddings for inference...")
+    
+    # Copy global speaker embeddings to checkpoint directories
+    # These are the SAME embeddings used during training!
+    embedding_extracted = False
+    
+    if global_speaker_embeddings is not None:
+        for ckpt_dir in [output_dir / "best_checkpoint", output_dir / "final_checkpoint"]:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            emb_path = ckpt_dir / "speaker_embeddings.pt"
+            save_global_features(global_speaker_embeddings, emb_path)
+        
+        # Also save at output root
+        save_global_features(global_speaker_embeddings, speaker_emb_path)
+        
+        print(f"  ✓ Speaker embeddings saved to:")
+        print(f"    {speaker_emb_path}")
+        print(f"    {output_dir / 'best_checkpoint' / 'speaker_embeddings.pt'}")
+        print(f"\n  These are the EXACT same embeddings used during training!")
+        print(f"  Using them at inference ensures perfect conditioning match.")
+        embedding_extracted = True
+    else:
+        print("  ⚠ No global speaker embeddings to save")
+        print("  Training used per-sample conditioning")
+        print("\n  To extract embeddings for promptless inference:")
+        print(f"    python tools/extract_embeddings.py --speaker {args.speaker}")
+    
+    print("\n[5/5] Complete!")
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE!")
     print("=" * 60)
-    print(f"""
+    
+    if embedding_extracted:
+        print(f"""
+Best validation loss: {best_val_loss:.4f}
+
+Output files:
+  Final LoRA: {final_dir}
+  Best LoRA: {output_dir / 'best_checkpoint'}
+  Speaker Embeddings: {speaker_emb_path}
+
+KEY: The speaker embeddings used at training are SAVED and will be used at inference.
+     This ensures the LoRA adaptations are NOT overshadowed by different conditioning!
+
+HOW TO USE (PROMPTLESS - NO REFERENCE AUDIO NEEDED!):
+=====================================================
+# Option 1: Use the inference helper
+python tools/infer_verbatim.py --speaker {args.speaker} --text "I I I was going going to..."
+
+# Option 2: Python API
+from indextts import IndexTTS2
+from indextts.speaker_embeddings import SpeakerEmbeddingStore
+
+# Load model with LoRA
+tts = IndexTTS2(lora_path="{final_dir}")
+
+# Load stored speaker embeddings (SAME ones used during training!)
+store = SpeakerEmbeddingStore(tts)
+speaker_embeddings = store.load_embeddings("{speaker_emb_path}")
+
+# Generate - NO REFERENCE AUDIO NEEDED!
+# Input with stutters → Output has stutters!
+tts.infer(
+    text="I I I was going going to the store...",
+    output_path="output.wav",
+    speaker_embeddings=speaker_embeddings  # Uses SAME conditioning as training!
+)
+
+# For clean speech, input clean text:
+tts.infer(
+    text="I was going to the store.",
+    output_path="output_clean.wav",
+    speaker_embeddings=speaker_embeddings
+)
+
+The model learned:
+  stuttered text → stuttered speech
+  clean text → clean speech
+  
+And the speaker embeddings ensure EXACT conditioning match!
+""")
+    else:
+        print(f"""
 Best validation loss: {best_val_loss:.4f}
 
 Output files:
   Final LoRA: {final_dir}
   Best LoRA: {output_dir / 'best_checkpoint'}
 
-HOW TO USE:
-===========
-1. For inference WITH stutters, input verbatim text:
+⚠ WARNING: Training used per-sample conditioning.
+The LoRA may not perform optimally because inference will use different conditioning.
 
-    from indextts import IndexTTS2
-    
-    tts = IndexTTS2(lora_path="{final_dir}")
-    
-    # Input with stutters → Output has stutters!
-    tts.infer(
-        spk_audio_prompt="reference.wav",
-        text="I I I was going going to the store...",
-        output_path="output.wav"
-    )
+To fix this for future trainings:
+  - Ensure --extract-speaker-embeddings is set (default)
+  - Use --embedding-mode=single (default, preserves patterns)
+  - Provide audio files in the manifest
 
-2. For clean speech, input clean text:
-
-    tts.infer(
-        spk_audio_prompt="reference.wav", 
-        text="I was going to the store.",
-        output_path="output_clean.wav"
-    )
-
-The model has learned the DIRECT mapping:
-  stuttered text → stuttered speech
-  clean text → clean speech
+For this model, either:
+1. Use a reference audio at inference time
+2. Extract speaker embeddings manually:
+   python tools/extract_embeddings.py --speaker {args.speaker}
 """)
 
 

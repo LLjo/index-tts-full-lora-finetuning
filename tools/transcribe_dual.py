@@ -30,7 +30,9 @@ import sys
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
+import torch
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+from datasets import load_dataset
 import torch
 from tqdm import tqdm
 
@@ -65,22 +67,29 @@ class DualTranscriber:
     
     def _init_whisper(self, model_name: str):
         """Initialize FastWhisper model."""
-        try:
-            from faster_whisper import WhisperModel
+        # try:
+        #     from faster_whisper import WhisperModel
             
-            # faster-whisper/ctranslate2 expects "cuda" not "cuda:0"
-            whisper_device = self.device
-            if whisper_device.startswith("cuda:"):
-                whisper_device = "cuda"
+        #     # faster-whisper/ctranslate2 expects "cuda" not "cuda:0"
+        #     whisper_device = self.device
+        #     if whisper_device.startswith("cuda:"):
+        #         whisper_device = "cuda"
             
-            self.whisper = WhisperModel(
-                model_name,
-                device=whisper_device,
-                compute_type=self.compute_type,
-            )
-        except ImportError:
-            print("  ⚠ FastWhisper not installed. Install with: pip install faster-whisper")
-            self.whisper = None
+        #     self.whisper = WhisperModel(
+        #         model_name,
+        #         device='cpu',
+        #         # compute_type=self.compute_type,
+        #     )
+        # except ImportError:
+        #     print("  ⚠ FastWhisper not installed. Install with: pip install faster-whisper")
+        #     self.whisper = None
+
+        self.whisper = AutoModelForSpeechSeq2Seq.from_pretrained(
+            "openai/whisper-large-v3-turbo", torch_dtype=self.compute_type, low_cpu_mem_usage=True, use_safetensors=True
+        )
+        self.processor = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.whisper.to(device)
     
     def _init_parakeet(self, model_name: str):
         """Initialize NVIDIA Parakeet model."""
@@ -115,17 +124,20 @@ class DualTranscriber:
         if self.whisper is None:
             return ""
         
-        try:
-            segments, _ = self.whisper.transcribe(
-                audio_path,
-                beam_size=5,
-                language="en",  # Adjust if needed
-                vad_filter=True,
-            )
-            return " ".join(seg.text.strip() for seg in segments).strip()
-        except Exception as e:
-            warnings.warn(f"FastWhisper failed for {audio_path}: {e}")
-            return ""
+        
+
+        pipe = pipeline(
+            "automatic-speech-recognition",
+            model=self.whisper,
+            tokenizer=self.processor.tokenizer,
+            feature_extractor=self.processor.feature_extractor,
+            torch_dtype=self.compute_type,
+            device="cuda:0" if torch.cuda.is_available() else "cpu",
+        )
+
+        result = pipe(audio_path)
+        print(result["text"])
+        return result["text"]
     
     def transcribe_parakeet(self, audio_path: str) -> str:
         """Transcribe with Parakeet (verbatim output)."""
@@ -205,7 +217,6 @@ class DualTranscriber:
                 #                 ))
                 #         except (KeyError, ValueError, TypeError) as e:
                 #             continue
-                
                 return full_text.strip()#, words, "en"
             
             finally:
@@ -251,44 +262,10 @@ class DualTranscriber:
         fastwhisper_text = self.transcribe_whisper(audio_path)
         parakeet_text = self.transcribe_parakeet(audio_path)
         
-        # If Parakeet failed but we have whisper, create a "verbatim-like" version
-        # by using whisper with different settings
-        if not parakeet_text and fastwhisper_text and use_whisper_fallback:
-            # Use whisper but with more verbatim-like settings
-            parakeet_text = self._transcribe_whisper_verbatim(audio_path)
-        
         return {
             "fastwhisper": fastwhisper_text,
             "parakeet": parakeet_text,
         }
-    
-    def _transcribe_whisper_verbatim(self, audio_path: str) -> str:
-        """
-        Transcribe with WhisperModel using verbatim-like settings.
-        This is a fallback when Parakeet is not available.
-        
-        Uses settings that preserve more natural speech patterns:
-        - Lower beam size for less smoothing
-        - No VAD filter (preserve all pauses)
-        - Hallucination suppression disabled
-        """
-        if self.whisper is None:
-            return ""
-        
-        try:
-            segments, _ = self.whisper.transcribe(
-                audio_path,
-                beam_size=1,  # Less smoothing
-                language="en",
-                vad_filter=False,  # Don't filter silence
-                word_timestamps=True,  # Get word timings
-                condition_on_previous_text=True,  # More coherent
-            )
-            return " ".join(seg.text.strip() for seg in segments).strip()
-        except Exception as e:
-            warnings.warn(f"Whisper verbatim fallback failed for {audio_path}: {e}")
-            return ""
-
 
 def find_audio_files(audio_dir: Path) -> List[Path]:
     """Find all audio files in directory."""
@@ -312,9 +289,9 @@ def main():
     parser.add_argument("--output-csv", type=Path, help="Output CSV path")
     
     # Model options
-    parser.add_argument("--whisper-model", default="large-v3",
+    parser.add_argument("--whisper-model", default="medium",
                         help="FastWhisper model size (default: large-v3)")
-    parser.add_argument("--parakeet-model", default="nvidia/parakeet-ctc-1.1b",
+    parser.add_argument("--parakeet-model", default="nvidia/parakeet-tdt-0.6b-v3",
                         help="Parakeet model name")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--compute-type", default="float16",
