@@ -19,6 +19,7 @@ This module fixes these by maintaining synthesis context across chunks.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import queue
 import time
@@ -81,8 +82,56 @@ class StreamingConfigV2:
     diffusion_steps: int = 20
     # Faster diffusion for first chunk (TTFA optimization)
     first_chunk_diffusion_steps: int = 12
-    # CFM inference rate  
+    # CFM inference rate
     inference_cfg_rate: float = 0.7
+    # CFG rate for the first chunk only. CFG doubles the per-step DiT compute (it batches
+    # the conditional + unconditional pass), so dropping it to 0 on the first chunk roughly
+    # halves first-chunk diffusion latency. Subsequent chunks still get `inference_cfg_rate`.
+    first_chunk_cfg_rate: float = 0.0
+    # ODE solver for CFM: "euler" (1st-order, 1 estimator call/step) or "heun" (2nd-order,
+    # 2 calls/step but ~half the steps for equivalent quality).
+    solver: str = "heun"
+
+    # Pause GPT decode while synth (CFM+BigVGAN) is running for that chunk. Default on:
+    # without this, GPT's autoregressive decode kernels share SMs with CFM diffusion,
+    # which makes CFM run 3-4× slower (per per-stage timing data). Serializing them
+    # actually *improves* both TTFA and steady-state cadence because GPT has way more
+    # slack than it needs to feed the synth queue.
+    serialize_synth_with_gpt: bool = True
+
+    # When True, every non-first chunk gets exactly `context_mel_frames_target` frames
+    # of mel context concatenated before the new cond, zero-padded on the left if the
+    # previous chunk produced fewer frames. This keeps the CFM input shape constant
+    # across chunks 2+ so torch.compile's dynamic-shape recompile only happens once.
+    # Without padding, chunk 2 has fewer context frames than chunks 3+ and pays a
+    # partial recompile cost (~140ms first time it hits the chunk-2 shape).
+    pad_mel_context: bool = True
+    # The fixed-size mel-context window to pad/truncate to. Pick a value at least as
+    # large as the expected previous-chunk cond size to avoid lossy truncation. The
+    # ultra_fast preset's chunk_tokens=40 → ~69 frames of cond, so 100 is comfortable.
+    context_mel_frames_target: int = 100
+
+    # When True, call torch.cuda.empty_cache() after each stream completes. PyTorch's
+    # caching allocator otherwise holds onto freed blocks, which inflates the GPU
+    # footprint in nvidia-smi monotonically as you serve more requests. Negligible
+    # cost (a handful of ms once, plus a slightly cold allocator on the next call).
+    release_cuda_cache_on_done: bool = True
+
+    # When True (and the accel engine is active), reuse the decode-time hidden states
+    # the accel engine already produced for each generated token instead of re-running
+    # a full GPT forward in the synth worker to extract S2Mel's latent. Saves ~10-30ms
+    # per chunk.
+    #
+    # OFF BY DEFAULT — Quick Win #3 in docs/STREAMING_LATENCY_ROADMAP.md. The accel
+    # engine's hidden states come from a fused-attention + CUDA-graph path and may not
+    # be numerically bit-identical to the eager `tts.gpt(...)` forward this replaces.
+    # A/B audio output (especially for the trained LoRA stutter voice) before turning on.
+    #
+    # When enabled, the chunk-dispatch logic lags by one token (because the latest
+    # token's hidden state isn't captured until the next decode iteration). Effective
+    # chunk sizes stay the same — the streamer just waits one extra token before
+    # flushing the previous chunk.
+    use_decoded_hidden_states: bool = False
     
     # === Audio stitching ===
     # Crossfade samples in audio domain (fallback)
@@ -231,17 +280,19 @@ class ProgressiveMelSynthesizer:
         device = self.spk_cond_emb.device
         self.chunk_index += 1
         
-        # Select diffusion steps based on chunk position
+        # Select diffusion steps based on chunk position. Middle/final chunks
+        # use the configured `diffusion_steps`; only the first chunk gets the
+        # cheaper `first_chunk_diffusion_steps` budget. The legacy `max(12, …)`
+        # floor was overriding the config (e.g. ultra_fast asks for 10 steps but
+        # got 12) — config wins now.
         if is_first:
             diffusion_steps = self.config.first_chunk_diffusion_steps
-        elif is_final:
-            diffusion_steps = self.config.diffusion_steps
         else:
-            diffusion_steps = max(12, self.config.diffusion_steps - 3)
-        
+            diffusion_steps = self.config.diffusion_steps
+
         with torch.no_grad():
             use_autocast = self.tts.dtype is not None and device.type == 'cuda'
-            
+
             with torch.amp.autocast(device.type, enabled=use_autocast, dtype=self.tts.dtype or torch.float32):
                 # GPT forward pass for latent
                 use_speed = torch.zeros(1, device=device, dtype=torch.long)
@@ -270,19 +321,25 @@ class ProgressiveMelSynthesizer:
                     S_infer, ylens=target_lengths, n_quantizers=3, f0=None
                 )[0]
                 
-                # Build condition with context
+                # Build condition with context. Track the exact frames prepended so the
+                # post-CFM slice matches (previous code used a fixed config offset that
+                # could exceed the actual previous mel length, leaving an empty tensor).
                 if self.config.mode == StreamingMode.PROGRESSIVE_CONTEXT and self.previous_mel_context is not None:
-                    # Include mel context from previous chunk
-                    context_frames = self.config.context_mel_frames
+                    context_frames_used = min(
+                        self.config.context_mel_frames,
+                        self.previous_mel_context.size(1),
+                    )
                     extended_prompt = torch.cat([
                         self.prompt_condition,
-                        self.previous_mel_context[:, -context_frames:, :]
+                        self.previous_mel_context[:, -context_frames_used:, :]
                     ], dim=1)
                     cat_condition = torch.cat([extended_prompt, cond], dim=1)
                 else:
+                    context_frames_used = 0
                     cat_condition = torch.cat([self.prompt_condition, cond], dim=1)
                 
                 # CFM diffusion
+                cfg_rate = self.config.first_chunk_cfg_rate if is_first else self.config.inference_cfg_rate
                 vc_target = self.tts.s2mel.models['cfm'].inference(
                     cat_condition,
                     torch.LongTensor([cat_condition.size(1)]).to(device),
@@ -290,15 +347,12 @@ class ProgressiveMelSynthesizer:
                     self.style,
                     None,
                     diffusion_steps,
-                    inference_cfg_rate=self.config.inference_cfg_rate
+                    inference_cfg_rate=cfg_rate,
+                    solver_type=self.config.solver,
                 )
-                
-                # Extract new mel (skip ref_mel portion and context if used)
-                if self.config.mode == StreamingMode.PROGRESSIVE_CONTEXT and self.previous_mel_context is not None:
-                    context_frames = self.config.context_mel_frames
-                    vc_target = vc_target[:, :, self.ref_mel.size(-1) + context_frames:]
-                else:
-                    vc_target = vc_target[:, :, self.ref_mel.size(-1):]
+
+                # Extract new mel: drop ref_mel echo plus the exact context we prepended.
+                vc_target = vc_target[:, :, self.ref_mel.size(-1) + context_frames_used:]
                 
                 # Store mel context for next chunk
                 if self.config.mode == StreamingMode.PROGRESSIVE_CONTEXT:
@@ -419,42 +473,67 @@ class EnhancedProgressiveSynthesizer(ProgressiveMelSynthesizer):
         speech_conditioning_latent: torch.Tensor,
         is_first: bool = False,
         is_final: bool = False,
+        log_event: Optional[Callable[..., None]] = None,
+        precomputed_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Synthesize with full GPT context from previous chunks.
+
+        precomputed_latent: optional [1, len(codes), hidden_dim] tensor that
+        replaces the redundant tts.gpt(...) forward — used by Quick Win #3
+        when the accel engine has already produced the per-token hidden states.
         """
         device = self.spk_cond_emb.device
         self.chunk_index += 1
-        
-        # Progressive temperature - start stable, allow variation later
+        chunk_idx = self.chunk_index
+
+        # Local no-op when no logger is provided. Each substage forces a CUDA sync
+        # before logging so we measure GPU completion time, not kernel launch time.
+        if log_event is None:
+            def _emit(event: str, **extra):
+                pass
+        else:
+            def _emit(event: str, **extra):
+                if device.type == "cuda":
+                    torch.cuda.current_stream(device).synchronize()
+                log_event(event, chunk_idx=chunk_idx, **extra)
+
+        # Select diffusion steps based on chunk position. Middle/final chunks
+        # use the configured `diffusion_steps`; only the first chunk gets the
+        # cheaper `first_chunk_diffusion_steps` budget. The legacy `max(12, …)`
+        # floor was silently overriding the config (e.g. ultra_fast asks for 10
+        # but got 12 — ~70 ms wasted per chunk). Config wins now; raise
+        # `diffusion_steps` in the preset if you actually want more.
         if is_first:
             diffusion_steps = self.config.first_chunk_diffusion_steps
-        elif is_final:
-            diffusion_steps = self.config.diffusion_steps
         else:
-            # Gradually increase quality for middle chunks
-            diffusion_steps = max(12, self.config.diffusion_steps - 3)
+            diffusion_steps = self.config.diffusion_steps
         
         with torch.no_grad():
             use_autocast = self.tts.dtype is not None and device.type == 'cuda'
-            
+
             with torch.amp.autocast(device.type, enabled=use_autocast, dtype=self.tts.dtype or torch.float32):
                 use_speed = torch.zeros(1, device=device, dtype=torch.long)
-                
+
+                if precomputed_latent is not None:
+                    # Quick Win #3: reuse the decode-time hidden states the accel
+                    # engine already computed for these codes. Saves a full GPT
+                    # forward (~10-30ms per chunk).
+                    latent = precomputed_latent
                 # For non-first chunks, prepend previous codes for context
-                if self.config.mode == StreamingMode.PROGRESSIVE_CONTEXT and len(self.cumulative_codes) > 0:
+                elif self.config.mode == StreamingMode.PROGRESSIVE_CONTEXT and len(self.cumulative_codes) > 0:
                     # Use last N codes as context (e.g., last 30 tokens)
                     context_length = min(30, len(self.cumulative_codes))
                     context_codes = torch.tensor(
-                        [self.cumulative_codes[-context_length:]], 
-                        dtype=torch.long, 
+                        [self.cumulative_codes[-context_length:]],
+                        dtype=torch.long,
                         device=device
                     )
-                    
+
                     # Concatenate context + new codes
                     full_codes = torch.cat([context_codes, codes], dim=1)
                     full_code_lens = torch.tensor([full_codes.shape[1]], device=device)
-                    
+
                     # Run GPT with full context
                     latent = self.tts.gpt(
                         speech_conditioning_latent,
@@ -468,7 +547,7 @@ class EnhancedProgressiveSynthesizer(ProgressiveMelSynthesizer):
                         emo_vec=self.emo_vec.squeeze(1) if self.emo_vec.dim() == 3 else self.emo_vec,
                         use_speed=use_speed,
                     )
-                    
+
                     # Extract only the NEW portion of latent
                     latent = latent[:, -codes.shape[1]:, :]
                 else:
@@ -485,40 +564,77 @@ class EnhancedProgressiveSynthesizer(ProgressiveMelSynthesizer):
                         emo_vec=self.emo_vec.squeeze(1) if self.emo_vec.dim() == 3 else self.emo_vec,
                         use_speed=use_speed,
                     )
-                
+
+                _emit("synth_gpt_latent_done")
+
                 # Store codes for next chunk's context
                 self.cumulative_codes.extend(codes[0].cpu().tolist())
                 # Limit cumulative size to prevent memory issues
                 if len(self.cumulative_codes) > 200:
                     self.cumulative_codes = self.cumulative_codes[-200:]
-                
+
                 # S2Mel stage with enhanced context
                 latent = self.tts.s2mel.models['gpt_layer'](latent)
                 S_infer = self.tts.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                 S_infer = S_infer.transpose(1, 2)
                 S_infer = S_infer + latent
                 target_lengths = (code_lens * 1.72).long()
-                
+
                 cond = self.tts.s2mel.models['length_regulator'](
                     S_infer, ylens=target_lengths, n_quantizers=3, f0=None
                 )[0]
+
+                _emit("synth_length_reg_done")
                 
-                # Enhanced mel context with larger window
-                if self.previous_mel_context is not None:
-                    # Use larger context for better continuity (100 frames ~= 0.5s)
-                    context_frames = min(100, self.config.context_mel_frames * 2)
-                    extended_prompt = torch.cat([
-                        self.prompt_condition,
-                        self.previous_mel_context[:, -context_frames:, :]
-                    ], dim=1)
+                # Enhanced mel context with larger window. Track the actual number of
+                # context frames prepended so the post-CFM slice matches exactly. The
+                # previous version sliced with a hardcoded 100 even when no context was
+                # added (chunk 1) or when the previous chunk was shorter than 100 frames,
+                # leaving an empty mel and crashing BigVGAN.
+                #
+                # When `pad_mel_context` is on, every non-first chunk gets a fixed
+                # `context_mel_frames_target`-frame context (left-zero-padded if the
+                # actual previous mel is shorter). This keeps the CFM input shape
+                # constant across chunks 2+, so torch.compile's dynamic-shape branch
+                # only specializes once.
+                use_mel_context = (
+                    self.config.mode == StreamingMode.PROGRESSIVE_CONTEXT
+                    and self.previous_mel_context is not None
+                )
+                if use_mel_context:
+                    if self.config.pad_mel_context:
+                        context_target = self.config.context_mel_frames_target
+                        available = self.previous_mel_context.size(1)
+                        if available >= context_target:
+                            actual_ctx = self.previous_mel_context[:, -context_target:, :]
+                        else:
+                            # Left-pad with zeros so the real (most recent) context
+                            # stays adjacent to the new cond — pad first, then real.
+                            pad = torch.zeros(
+                                self.previous_mel_context.size(0),
+                                context_target - available,
+                                self.previous_mel_context.size(2),
+                                device=self.previous_mel_context.device,
+                                dtype=self.previous_mel_context.dtype,
+                            )
+                            actual_ctx = torch.cat([pad, self.previous_mel_context], dim=1)
+                        context_frames_used = context_target
+                    else:
+                        requested_ctx = min(100, self.config.context_mel_frames * 2)
+                        context_frames_used = min(requested_ctx, self.previous_mel_context.size(1))
+                        actual_ctx = self.previous_mel_context[:, -context_frames_used:, :]
+                    extended_prompt = torch.cat([self.prompt_condition, actual_ctx], dim=1)
                     cat_condition = torch.cat([extended_prompt, cond], dim=1)
                 else:
+                    context_frames_used = 0
                     cat_condition = torch.cat([self.prompt_condition, cond], dim=1)
-                
-                # Store mel context
+
+                # Save mel context for the NEXT call. Must happen after context_frames_used
+                # is computed for this call.
                 self.previous_mel_context = cond.clone()
                 
                 # CFM diffusion
+                cfg_rate = self.config.first_chunk_cfg_rate if is_first else self.config.inference_cfg_rate
                 vc_target = self.tts.s2mel.models['cfm'].inference(
                     cat_condition,
                     torch.LongTensor([cat_condition.size(1)]).to(device),
@@ -526,22 +642,24 @@ class EnhancedProgressiveSynthesizer(ProgressiveMelSynthesizer):
                     self.style,
                     None,
                     diffusion_steps,
-                    inference_cfg_rate=self.config.inference_cfg_rate
+                    inference_cfg_rate=cfg_rate,
+                    solver_type=self.config.solver,
                 )
-                
-                # Extract new mel
-                if self.previous_mel_context is not None:
-                    context_frames = min(100, self.config.context_mel_frames * 2)
-                    vc_target = vc_target[:, :, self.ref_mel.size(-1) + context_frames:]
-                else:
-                    vc_target = vc_target[:, :, self.ref_mel.size(-1):]
-                
+
+                _emit("synth_cfm_done", steps=diffusion_steps)
+
+                # Extract new mel: skip the ref_mel echo and however many context frames
+                # we actually prepended this call.
+                vc_target = vc_target[:, :, self.ref_mel.size(-1) + context_frames_used:]
+
                 # Vocoding
                 with torch.cuda.amp.autocast(enabled=False):
                     # Ensure the input is float32 and on the correct device
                     vc_target_f32 = vc_target.to(device=device, dtype=torch.float32)
                     wav = self.tts.bigvgan(vc_target_f32).squeeze()
-        
+
+                _emit("synth_bigvgan_done")
+
         # Audio processing
         wav = torch.clamp(32767 * wav, -32767.0, 32767.0).cpu()
         if wav.dim() == 1:
@@ -642,6 +760,14 @@ def streaming_inference_v2(
     max_mel_tokens: int = 600,
     # Callbacks
     on_audio_chunk: Optional[Callable[[torch.Tensor], None]] = None,
+    # Diagnostics: caller-provided list that gets `{event, t_ms, ...}` entries
+    # for every major pipeline stage. Lets the API surface per-stage timing.
+    timing_log: Optional[List[dict]] = None,
+    # When set, reuses a previously-computed (gpt_conditioning, emo_vec) tuple
+    # under this key from the model's `_cond_latent_cache`. The api passes the
+    # speaker embedding file path here so repeated requests for the same speaker
+    # skip the conditioning encoder forward.
+    cond_cache_key: Optional[str] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     High-quality streaming TTS inference.
@@ -672,9 +798,19 @@ def streaming_inference_v2(
         device = torch.device(device)
     
     use_autocast = tts.dtype is not None and device.type == 'cuda'
-    
+
     start_time = time.perf_counter()
-    
+
+    def log_event(event: str, **extra) -> None:
+        if timing_log is not None:
+            timing_log.append({
+                "event": event,
+                "t_ms": round((time.perf_counter() - start_time) * 1000, 2),
+                **extra,
+            })
+
+    log_event("request_start")
+
     if config.verbose:
         print(f"[StreamingV2] Mode: {config.mode.value}")
         print(f"[StreamingV2] Extracting conditioning...")
@@ -746,8 +882,18 @@ def streaming_inference_v2(
         style = speaker_embeddings['style'].to(device)
         prompt_condition = speaker_embeddings['prompt_condition'].to(device)
         ref_mel = speaker_embeddings['ref_mel'].to(device)
-        
-        if speech_conditioning_latent is None:
+
+        # If a cache key is supplied, see if we've already paid the conditioning
+        # encoder cost for this speaker. Cache stores fully device-resident tensors.
+        cond_cache = getattr(tts, "_cond_latent_cache", None)
+        cache_entry = None
+        if speech_conditioning_latent is None and cond_cache is not None and cond_cache_key:
+            cache_entry = cond_cache.get(cond_cache_key)
+
+        if cache_entry is not None:
+            speech_conditioning_latent = cache_entry["gpt_conditioning"]
+            emo_vec = cache_entry["emo_vec"]
+        elif speech_conditioning_latent is None:
             cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device)
             with torch.no_grad():
                 with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
@@ -757,6 +903,11 @@ def streaming_inference_v2(
                     emo_cond = tts.gpt.get_emo_conditioning(spk_cond_emb.transpose(1, 2), cond_lengths)
                     emo_vec = tts.gpt.emovec_layer(emo_cond)
                     emo_vec = tts.gpt.emo_layer(emo_vec)
+            if cond_cache is not None and cond_cache_key:
+                cond_cache[cond_cache_key] = {
+                    "gpt_conditioning": speech_conditioning_latent,
+                    "emo_vec": emo_vec,
+                }
         else:
             speech_conditioning_latent = speech_conditioning_latent.to(device)
     else:
@@ -842,6 +993,7 @@ def streaming_inference_v2(
         )
     else:
         # FAST_CHUNKS, PROGRESSIVE_CONTEXT, OVERLAP_SYNTHESIS
+        log_event("conditioning_done")
         yield from _stream_by_tokens(
             tts=tts,
             text=text,
@@ -857,6 +1009,8 @@ def streaming_inference_v2(
             top_k=top_k,
             max_mel_tokens=max_mel_tokens,
             on_audio_chunk=on_audio_chunk,
+            log_event=log_event,
+            stream_start_anchor=start_time,
         )
 
 
@@ -1029,6 +1183,8 @@ def _stream_by_tokens(
     top_k: int,
     max_mel_tokens: int,
     on_audio_chunk: Optional[Callable],
+    log_event: Optional[Callable[..., None]] = None,
+    stream_start_anchor: Optional[float] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     TRUE token-level streaming - synthesize chunks AS tokens are generated.
@@ -1038,7 +1194,22 @@ def _stream_by_tokens(
     """
     device = spk_cond_emb.device
     use_autocast = tts.dtype is not None and device.type == 'cuda'
-    
+
+    # Route through the accel engine when available — it captures CUDA graphs around the
+    # per-token decode loop, which is otherwise bottlenecked by kernel-launch overhead.
+    # `use_accel=True` on IndexTTS2 construction is what populates `tts.gpt.accel_engine`.
+    # Resolved up front so the streamer can decide whether to lag-by-1 dispatch (Quick
+    # Win #3 only makes sense when the accel engine is actually populating hidden states).
+    accel_engine = getattr(tts.gpt, "accel_engine", None)
+    use_hidden_state_reuse = (
+        config.use_decoded_hidden_states and accel_engine is not None
+    )
+
+    # No-op fallback when caller didn't supply a logger.
+    if log_event is None:
+        def log_event(event, **extra):
+            pass
+
     # Tokenize full text
     text_tokens_list = tts.tokenizer.tokenize(text)
     text_token_ids = tts.tokenizer.convert_tokens_to_ids(text_tokens_list)
@@ -1079,190 +1250,388 @@ def _stream_by_tokens(
     stop_mel_token = tts.stop_mel_token
     start_mel_token = tts.gpt.start_mel_token
     
-    # Queue for passing audio chunks from streamer to generator
+    # Synthesis runs on a dedicated worker thread (NOT inline in streamer.put), so that
+    # the GPT decode keeps producing tokens for chunk N+1 while CFM+BigVGAN render
+    # chunk N. The streamer's job shrinks to: buffer tokens, push a SynthJob to the
+    # synth worker when a chunk threshold is hit.
     audio_queue: queue.Queue[Optional[torch.Tensor]] = queue.Queue()
+    # Queue tuple: (tokens, is_first, is_final, chunk_idx, token_offset)
+    # `token_offset` is the position of `tokens[0]` in the cumulative generated
+    # sequence — used by Quick Win #3 to index accel_engine.last_decoded_hidden_states.
+    synth_queue: queue.Queue[Optional[tuple]] = queue.Queue()
     generation_done = threading.Event()
+    # Fatal errors (GPT generation itself blew up) — re-raised to the caller.
     generation_error: List[Exception] = []
-    
-    # Streaming synthesizer that processes chunks during generation
+    # Per-chunk synthesis failures — logged but not fatal; we just skip the chunk.
+    # Only escalated if zero chunks ever succeeded.
+    chunk_errors: List[Exception] = []
+    chunk_success_count = [0]  # boxed so the inner class can mutate it
+    first_audio_time_ref: List[Optional[float]] = [None]
+    stream_start_time = stream_start_anchor if stream_start_anchor is not None else time.perf_counter()
+
+    # Serialization gate: when synth is running CFM/BigVGAN, clear this so streamer.put
+    # (and therefore the accel-engine decode loop) blocks. Per-stage timing showed CFM
+    # runs 3-4× slower when GPT is concurrently decoding because they share the same
+    # SMs — even with separate CUDA streams. Pausing GPT for the ~250ms of synth gives
+    # CFM the GPU alone, which makes the chunk finish faster than the parallel version.
+    gpt_can_proceed = threading.Event()
+    gpt_can_proceed.set()  # initially: nothing in synth, GPT free to run
+
+    # Streaming synthesizer that buffers tokens and dispatches synth jobs to the worker.
     class StreamingSynthesizer(BaseStreamer):
-        """Streamer that synthesizes audio chunks as mel tokens are generated."""
-        
+        """Streamer that buffers mel tokens and queues synth jobs to a worker thread."""
+
         def __init__(self):
             self.token_buffer: List[int] = []
             self.all_tokens: List[int] = []
             self.chunk_count = 0
             self.is_first_chunk = True
-            self.start_time = time.perf_counter()
-            self.first_audio_time: Optional[float] = None
-            
+            self.first_token_logged = False
+            # Position in the cumulative generated sequence at which the *next*
+            # dispatched chunk begins. Always equals (tokens already dispatched).
+            # Used by Quick Win #3 to index accel_engine.last_decoded_hidden_states.
+            self.dispatched_offset = 0
+
         def put(self, value: torch.Tensor):
-            """Called for each new token - synthesize when chunk is ready."""
+            """Called for each new token — buffer + queue a synth job at chunk thresholds.
+
+            If `serialize_synth_with_gpt` is on, block here while a previous chunk is
+            still synthesizing so GPT doesn't compete with CFM/BigVGAN for the GPU.
+            """
+            if config.serialize_synth_with_gpt:
+                gpt_can_proceed.wait()
+            if not self.first_token_logged:
+                log_event("gpt_first_token")
+                self.first_token_logged = True
             if value.dim() == 0:
                 value = value.unsqueeze(0)
-            
+
             new_tokens = value.squeeze().tolist()
             if isinstance(new_tokens, int):
                 new_tokens = [new_tokens]
-            
+
             for token in new_tokens:
                 # Skip special tokens
                 if token == stop_mel_token:
-                    # Synthesize remaining tokens as final chunk
+                    # Flush remaining tokens as final chunk (no lag needed: all
+                    # captured hidden states are guaranteed available by stop time).
                     if self.token_buffer:
-                        self._synthesize_chunk(is_final=True)
+                        self._queue_chunk(is_final=True, lag=0)
                     return
                 if token == start_mel_token:
                     continue
-                
+
                 self.token_buffer.append(token)
                 self.all_tokens.append(token)
-                
-                # Check if we should synthesize a chunk
+
+                # Check if we should dispatch a chunk. When using decoded hidden
+                # states, we lag dispatch by one token because the hidden state
+                # for the latest token isn't captured until the next decode
+                # iteration runs. So we require threshold + 1 in the buffer and
+                # ship out the first `threshold` tokens.
                 buffer_len = len(self.token_buffer)
-                threshold = config.min_chunk_tokens if self.is_first_chunk else config.chunk_tokens
-                
-                if buffer_len >= config.max_chunk_tokens:
-                    self._synthesize_chunk()
-                elif buffer_len >= threshold:
-                    self._synthesize_chunk()
-        
-        def _synthesize_chunk(self, is_final: bool = False):
-            """Synthesize current buffer into audio and queue it."""
+                base_threshold = (
+                    config.min_chunk_tokens if self.is_first_chunk else config.chunk_tokens
+                )
+                base_max = config.max_chunk_tokens
+                lag = 1 if use_hidden_state_reuse else 0
+                threshold = base_threshold + lag
+                max_chunk = base_max + lag
+
+                if buffer_len >= max_chunk or buffer_len >= threshold:
+                    self._queue_chunk(lag=lag)
+
+        def _queue_chunk(self, is_final: bool = False, lag: int = 0):
+            """Hand off the current buffer to the synth worker. Non-blocking.
+
+            When `lag > 0`, dispatch buffer[:-lag] and keep the last `lag` token(s)
+            in the buffer for the next chunk. Used by Quick Win #3 to ensure the
+            accel engine has time to capture the hidden state for every token we
+            ship out.
+            """
             if not self.token_buffer:
                 return
-            
-            chunk_tokens = self.token_buffer.copy()
-            self.token_buffer = []
+
+            if lag > 0 and len(self.token_buffer) > lag:
+                chunk_tokens = self.token_buffer[:-lag]
+                self.token_buffer = self.token_buffer[-lag:]
+            else:
+                chunk_tokens = self.token_buffer
+                self.token_buffer = []
+
+            if not chunk_tokens:
+                return
+
             self.chunk_count += 1
             is_first = self.is_first_chunk
             self.is_first_chunk = False
-            
-            if config.verbose:
-                print(f"  [Stream] Synthesizing chunk {self.chunk_count}: {len(chunk_tokens)} tokens")
-            
-            try:
-                # Synthesize audio from tokens
-                codes = torch.tensor([chunk_tokens], dtype=torch.long, device=device)
-                code_lens = torch.tensor([len(chunk_tokens)], device=device)
-                
-                wav = synthesizer.synthesize_with_gpt_context(
-                    codes=codes,
-                    code_lens=code_lens,
-                    text_tokens=text_tokens,
-                    speech_conditioning_latent=final_conditioning,
-                    is_first=is_first,
-                    is_final=is_final,
-                )
-                
-                # Track first audio time
-                if self.first_audio_time is None:
-                    self.first_audio_time = time.perf_counter() - self.start_time
-                    if config.verbose:
-                        print(f"  [Stream] FIRST AUDIO at {self.first_audio_time:.3f}s!")
-                
-                # Queue the audio chunk
-                audio_queue.put(wav)
-                
-                if on_audio_chunk is not None:
-                    on_audio_chunk(wav)
-                    
-            except Exception as e:
-                if config.verbose:
-                    print(f"  [Stream] Synthesis error: {e}")
-                generation_error.append(e)
-        
+            token_offset = self.dispatched_offset
+            self.dispatched_offset += len(chunk_tokens)
+
+            log_event("chunk_dispatched", chunk_idx=self.chunk_count, tokens=len(chunk_tokens))
+            synth_queue.put((chunk_tokens, is_first, is_final, self.chunk_count, token_offset))
+
         def end(self):
-            """Called when generation is complete."""
-            # Synthesize any remaining tokens
+            """Called when GPT generation completes."""
+            # Flush any leftover tokens as the final chunk (no lag — all captured
+            # hidden states are guaranteed available at this point).
             if self.token_buffer:
-                self._synthesize_chunk(is_final=True)
-            
+                self._queue_chunk(is_final=True, lag=0)
+            # Signal the synth worker that no more jobs are coming
+            synth_queue.put(None)
+
             if config.verbose:
-                total_time = time.perf_counter() - self.start_time
-                print(f"  [Stream] Generation complete:")
+                total_time = time.perf_counter() - stream_start_time
+                print(f"  [Stream] GPT generation complete:")
                 print(f"    Total tokens: {len(self.all_tokens)}")
-                print(f"    Chunks: {self.chunk_count}")
-                print(f"    Total time: {total_time:.3f}s")
-                if self.first_audio_time:
-                    print(f"    Time to first audio: {self.first_audio_time:.3f}s")
-    
+                print(f"    Chunks queued: {self.chunk_count}")
+                print(f"    GPT time: {total_time:.3f}s")
+
     streamer = StreamingSynthesizer()
+
+    # Dedicated CUDA stream for the synth worker. The default stream serializes all
+    # kernels — without this, the synth worker's `.cpu()` at the end of a chunk would
+    # implicitly sync the *entire* default stream, blocking GPT decode that's queued
+    # on it. Giving synth its own stream lets `.cpu()` sync only synth's work and
+    # leaves GPT decode running concurrently. This is the actual CFM↔GPT overlap.
+    synth_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+
+    def synth_worker():
+        """Drain synth_queue, run CFM+BigVGAN per chunk, push audio to audio_queue.
+
+        Decoupling synthesis from GPT decode is the main throughput win: while this
+        worker is running CFM diffusion (300-400ms) and BigVGAN (30-80ms) for chunk N,
+        the GPT decode thread keeps generating tokens for chunk N+1. Without this split
+        GPT would block on every chunk boundary.
+
+        Stream isolation: when running on CUDA, all synth ops are issued on
+        `synth_stream`. Conditioning tensors (spk_cond_emb, prompt_condition, ref_mel,
+        ...) were produced on the default stream before this worker started, so we
+        wait on the default stream once at startup to make them visible.
+        """
+        if synth_stream is not None:
+            synth_stream.wait_stream(torch.cuda.default_stream(device))
+
+        try:
+            while True:
+                item = synth_queue.get()
+                if item is None:  # sentinel from streamer.end() (or GPT error path)
+                    return
+                chunk_tokens, is_first, is_final, chunk_idx, token_offset = item
+
+                # Hold GPT off the GPU while we run this chunk. See the comment on
+                # `gpt_can_proceed` above for why this is a strict serialization.
+                if config.serialize_synth_with_gpt:
+                    gpt_can_proceed.clear()
+
+                log_event("synth_start", chunk_idx=chunk_idx, tokens=len(chunk_tokens))
+
+                if config.verbose:
+                    print(f"  [Synth] Chunk {chunk_idx}: {len(chunk_tokens)} tokens (is_first={is_first}, is_final={is_final})")
+
+                try:
+                    # Run the full chunk (GPT-latent forward, S2Mel length reg, CFM
+                    # diffusion, BigVGAN, .cpu()) on the synth stream so its sync
+                    # at .cpu() doesn't block GPT decode on the default stream.
+                    if synth_stream is not None:
+                        stream_ctx = torch.cuda.stream(synth_stream)
+                    else:
+                        stream_ctx = contextlib.nullcontext()
+
+                    # Optionally splice the decoded hidden states the accel engine
+                    # captured during decode into a [1, L, H] latent — saves a full
+                    # redundant GPT forward (~10-30ms). Only attempted when the user
+                    # opted in AND the accel engine actually populated the buffer.
+                    precomputed_latent = None
+                    if (
+                        use_hidden_state_reuse
+                        and getattr(accel_engine, "last_decoded_hidden_states", None)
+                    ):
+                        captured = accel_engine.last_decoded_hidden_states
+                        end_offset = token_offset + len(chunk_tokens)
+                        if end_offset <= len(captured):
+                            # Each entry is [1, hidden_dim] on the default stream.
+                            # Stack along dim=1 to get [1, L, hidden_dim], matching
+                            # what tts.gpt(...) returns.
+                            slice_tensors = captured[token_offset:end_offset]
+                            # Cross-stream sync: clones were queued on the default
+                            # stream; synth runs on synth_stream. Insert a wait so
+                            # synth_stream observes the writes before consuming.
+                            if synth_stream is not None:
+                                synth_stream.wait_stream(torch.cuda.default_stream(device))
+                            with stream_ctx:
+                                precomputed_latent = torch.stack(slice_tensors, dim=1)
+
+                    with stream_ctx:
+                        codes = torch.tensor([chunk_tokens], dtype=torch.long, device=device)
+                        code_lens = torch.tensor([len(chunk_tokens)], device=device)
+
+                        # Only collect substage timings for the first couple of chunks —
+                        # the per-substage cuda.synchronize() adds latency, so we want it
+                        # off in steady state once we know what we're looking at.
+                        substage_log = log_event if chunk_idx <= 2 else None
+
+                        wav = synthesizer.synthesize_with_gpt_context(
+                            codes=codes,
+                            code_lens=code_lens,
+                            text_tokens=text_tokens,
+                            speech_conditioning_latent=final_conditioning,
+                            is_first=is_first,
+                            is_final=is_final,
+                            log_event=substage_log,
+                            precomputed_latent=precomputed_latent,
+                        )
+
+                    log_event("synth_done", chunk_idx=chunk_idx, samples=int(wav.shape[-1]))
+
+                    if first_audio_time_ref[0] is None:
+                        first_audio_time_ref[0] = time.perf_counter() - stream_start_time
+                        if config.verbose:
+                            print(f"  [Synth] FIRST AUDIO at {first_audio_time_ref[0]:.3f}s!")
+
+                    audio_queue.put(wav)
+                    chunk_success_count[0] += 1
+
+                    if on_audio_chunk is not None:
+                        on_audio_chunk(wav)
+
+                except Exception as e:
+                    if config.verbose:
+                        print(f"  [Synth] Synthesis error on chunk {chunk_idx} (skipping): {e}")
+                    chunk_errors.append(e)
+                finally:
+                    # Whether the chunk succeeded or failed, let GPT run again. Otherwise
+                    # a single bad chunk would deadlock the whole pipeline.
+                    if config.serialize_synth_with_gpt:
+                        gpt_can_proceed.set()
+        finally:
+            # Always signal the yield loop that no more audio is coming, even if the
+            # worker itself crashed for some unexpected reason.
+            audio_queue.put(None)
+            # Final safety: ensure GPT thread isn't stuck waiting on the gate.
+            gpt_can_proceed.set()
     
-    # Run generation in background thread so we can yield audio chunks
     def run_generation():
-        """Run GPT generation with streaming synthesis."""
+        """Run GPT generation. Tokens flow into `streamer`, which enqueues synth jobs."""
         try:
             with torch.no_grad():
                 with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
-                    tts.gpt.inference_model.generate(
-                        input_ids,
-                        bos_token_id=tts.gpt.start_mel_token,
-                        pad_token_id=tts.gpt.stop_mel_token,
-                        eos_token_id=tts.gpt.stop_mel_token,
-                        attention_mask=attention_mask,
-                        max_length=input_ids.shape[1] + max_mel_tokens - 1,
-                        do_sample=True,
-                        top_p=top_p,
-                        top_k=top_k,
-                        temperature=temperature,
-                        num_return_sequences=1,
-                        streamer=streamer,
-                    )
+                    if accel_engine is not None:
+                        # Accel engine path: returns generated tokens but emits them
+                        # via `streamer.put()` along the way.
+                        max_new_tokens = max_mel_tokens - 1
+                        accel_engine.generate(
+                            input_ids,
+                            max_new_tokens=max_new_tokens,
+                            attention_mask=attention_mask,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            stop_tokens=[tts.gpt.stop_mel_token],
+                            tts_embeddings=inputs_embeds,
+                            tts_mel_embedding=tts.gpt.inference_model.embeddings,
+                            tts_text_pos_embedding=tts.gpt.inference_model.text_pos_embedding,
+                            streamer=streamer,
+                        )
+                    else:
+                        tts.gpt.inference_model.generate(
+                            input_ids,
+                            bos_token_id=tts.gpt.start_mel_token,
+                            pad_token_id=tts.gpt.stop_mel_token,
+                            eos_token_id=tts.gpt.stop_mel_token,
+                            attention_mask=attention_mask,
+                            max_length=input_ids.shape[1] + max_mel_tokens - 1,
+                            do_sample=True,
+                            top_p=top_p,
+                            top_k=top_k,
+                            temperature=temperature,
+                            num_return_sequences=1,
+                            streamer=streamer,
+                        )
         except Exception as e:
             generation_error.append(e)
+            # If generate() raised before streamer.end() was called, the synth worker
+            # would deadlock on synth_queue.get(). Send the sentinel ourselves.
+            synth_queue.put(None)
         finally:
             generation_done.set()
-            audio_queue.put(None)  # Sentinel to signal end
-    
+
     if config.verbose:
         print("[TokenLevel] Starting streaming generation...")
-    
-    # Start generation in background
-    gen_thread = threading.Thread(target=run_generation, daemon=True)
+
+    # Start GPT generation and synth worker in parallel.
+    gen_thread = threading.Thread(target=run_generation, daemon=True, name="gpt-gen")
+    synth_thread = threading.Thread(target=synth_worker, daemon=True, name="synth-worker")
     gen_start = time.perf_counter()
+    log_event("threads_starting")
+    synth_thread.start()
     gen_thread.start()
-    
-    # Yield audio chunks as they arrive
+
+    # Yield audio chunks as they arrive. The synth worker is the sole producer of
+    # audio_queue and always puts a final `None` sentinel when it exits.
     chunk_count = 0
     first_yield_time = None
-    
-    while True:
-        try:
-            # Wait for next chunk with timeout
-            wav = audio_queue.get(timeout=0.1)
+
+    try:
+        while True:
+            wav = audio_queue.get()  # blocks until a chunk (or sentinel) is ready
             if wav is None:
-                # Generation complete
                 break
             chunk_count += 1
+            log_event("chunk_yielded", chunk_idx=chunk_count, samples=int(wav.shape[-1]))
             if first_yield_time is None:
                 first_yield_time = time.perf_counter() - gen_start
                 if config.verbose:
                     print(f"  [Yield] First audio chunk at {first_yield_time:.3f}s")
             yield wav
-        except queue.Empty:
-            # Check if generation is done
-            if generation_done.is_set():
-                # Drain remaining items
-                while not audio_queue.empty():
-                    try:
-                        wav = audio_queue.get_nowait()
-                        if wav is not None:
-                            chunk_count += 1
-                            yield wav
-                    except queue.Empty:
-                        break
-                break
-    
-    # Wait for thread to finish
-    gen_thread.join(timeout=5.0)
-    
+    finally:
+        # Make sure we tear down even if the consumer disconnected mid-stream.
+        # Otherwise the GPT thread can stay blocked on the gate / synth queue.
+        gpt_can_proceed.set()
+        try:
+            synth_queue.put_nowait(None)
+        except Exception:
+            pass
+
+        # Wait for threads to finish cleanly
+        gen_thread.join(timeout=5.0)
+        synth_thread.join(timeout=5.0)
+
+        # Drop large per-stream tensors before any cache release so the allocator
+        # actually has freeable blocks to reclaim. Setting to None is enough —
+        # the synthesizer goes out of scope when the function returns.
+        try:
+            synthesizer.reset()
+        except Exception:
+            pass
+
+        # Release PyTorch's CUDA caching-allocator blocks back to the OS so the
+        # GPU footprint shown in nvidia-smi doesn't keep growing across requests.
+        # The accel engine's CUDA-graph captures are NOT affected: they live in
+        # their own pool and persist across calls.
+        if config.release_cuda_cache_on_done and device.type == "cuda":
+            try:
+                if accel_engine is not None:
+                    accel_engine.last_decoded_hidden_states = []
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+
+    # Fatal: GPT generation itself failed. Always raise.
     if generation_error:
         raise generation_error[0]
-    
+
+    # Per-chunk failures: only escalate if literally nothing was produced. Otherwise the
+    # client got partial audio and we'd be raising after-the-fact, which corrupts the
+    # response body.
+    if chunk_errors and chunk_success_count[0] == 0:
+        raise chunk_errors[0]
+
     if config.verbose:
         gen_time = time.perf_counter() - gen_start
         print(f"[TokenLevel] Done: {chunk_count} chunks in {gen_time:.3f}s")
+        if chunk_errors:
+            print(f"[TokenLevel] {len(chunk_errors)} chunk(s) skipped due to synthesis errors")
         if first_yield_time:
             print(f"[TokenLevel] Time to first audio: {first_yield_time:.3f}s")
 
@@ -1295,13 +1664,99 @@ def streaming_inference_generator_v2(
 
 # Utility functions for mode selection
 def get_fast_streaming_config() -> StreamingConfigV2:
-    """Get configuration optimized for lowest latency."""
+    """Lowest-latency preset that still bridges to chunk 2 without a player gap.
+
+    Sizing notes:
+        - 22 first-chunk tokens ≈ 38 mel frames ≈ 440ms of audio. After the 512-sample
+          (~23ms) tail trim the player gets ~417ms — comfortably longer than the
+          ~300-400ms synthesis time of chunk 2, so the playback buffer never drains.
+        - 5 Heun steps (= 10 DiT calls) with CFG=0 keeps first-chunk diffusion under
+          ~150ms while still denoising enough to produce clear audio.
+        - 512-sample crossfade is enough for speech to mask the boundary without
+          eating significant audio out of each chunk.
+
+    Mode is PROGRESSIVE_CONTEXT so chunks 2+ carry forward (a) last 30 GPT codes
+    into the per-chunk latent forward and (b) last 150 mel-cond frames into the
+    CFM. Chunk-1 TTFA is unaffected (no previous context to carry) but the
+    speaking arc / tone holds across boundaries instead of resetting per chunk.
+    """
     return StreamingConfigV2(
-        mode=StreamingMode.FAST_CHUNKS,
-        min_chunk_tokens=15,
+        mode=StreamingMode.PROGRESSIVE_CONTEXT,
+        min_chunk_tokens=22,
         chunk_tokens=40,
-        first_chunk_diffusion_steps=8,
-        diffusion_steps=15,
+        max_chunk_tokens=100,
+        first_chunk_diffusion_steps=5,
+        diffusion_steps=10,
+        first_chunk_cfg_rate=0.0,
+        inference_cfg_rate=0.7,
+        solver="heun",
+        crossfade_samples=512,
+        context_mel_frames_target=150,
+    )
+
+
+def get_fast_quality_streaming_config() -> StreamingConfigV2:
+    """`fast`-style TTFA with larger steady-state chunks for higher quality.
+
+    First chunk stays small (40 tokens ≈ 800ms audio) so TTFA matches `fast`,
+    then chunks 2+ grow to 100 tokens (≈ 2.0s audio each). Bigger chunks mean:
+        - More mel frames per CFM call → closer to training distribution
+          (CFM was trained on full-utterance pairs, so the bigger the chunk the
+          less it has to extrapolate).
+        - Fewer chunk boundaries across an utterance → fewer places for tone /
+          prosody to drift.
+        - Plenty of audio cushion for the player while the next chunk synthesizes
+          (a 100-token chunk synthesizes in ~600-900ms, plays for ~2.0s — buffer
+          never drains).
+
+    Use this when you want quality closer to `balanced` without paying the
+    sentence-level TTFA penalty.
+    """
+    return StreamingConfigV2(
+        mode=StreamingMode.PROGRESSIVE_CONTEXT,
+        min_chunk_tokens=40,
+        chunk_tokens=100,
+        max_chunk_tokens=200,
+        first_chunk_diffusion_steps=5,
+        diffusion_steps=10,
+        first_chunk_cfg_rate=0.0,
+        inference_cfg_rate=0.7,
+        solver="heun",
+        crossfade_samples=512,
+        context_mel_frames_target=150,
+    )
+
+
+def get_ultra_fast_streaming_config() -> StreamingConfigV2:
+    """Most aggressive TTFA preset that still plays without audible gaps.
+
+    Sizing math (with serialized GPT/synth, steady cadence is ~590ms per chunk):
+        - First chunk = 60 mel tokens → 60 × 1.72 frames × 256/22050s ≈ 1.2s of audio.
+          That covers the ~590ms wait for chunk 2 with comfortable margin and pulls
+          the first CFM call closer to the student's training distribution (see
+          docs/STREAMING_LATENCY_RESULTS.md §5).
+        - 5 Heun steps (= 10 DiT calls) with CFG=0 keeps first-chunk synth around
+          ~200ms warm. TTFA lands ~400-450ms on a warm pipeline (teacher CFM).
+
+    For the distilled student use `get_ultra_fast_distilled_streaming_config()` —
+    same chunking but solver=single_step / 1 step / CFG=0.0.
+
+    Mode is PROGRESSIVE_CONTEXT so chunks 2+ carry the last 30 GPT codes and last
+    150 mel-cond frames of the previous chunk into the next CFM call. Holds the
+    prosody arc across chunk boundaries; chunk-1 TTFA is unaffected.
+    """
+    return StreamingConfigV2(
+        mode=StreamingMode.PROGRESSIVE_CONTEXT,
+        min_chunk_tokens=60,
+        chunk_tokens=40,
+        max_chunk_tokens=100,
+        first_chunk_diffusion_steps=5,
+        diffusion_steps=10,
+        first_chunk_cfg_rate=0.0,
+        inference_cfg_rate=0.7,
+        solver="heun",
+        crossfade_samples=512,
+        context_mel_frames_target=150,
     )
 
 
@@ -1324,5 +1779,57 @@ def get_balanced_streaming_config() -> StreamingConfigV2:
         max_sentence_chars=150,
         diffusion_steps=20,
         first_chunk_diffusion_steps=12,
+        crossfade_samples=2048,
+    )
+
+
+def get_ultra_fast_distilled_streaming_config() -> StreamingConfigV2:
+    """Ultra-fast preset baked for a distilled CFM student.
+
+    Pairs the bumped first-chunk size from `get_ultra_fast_streaming_config()` with
+    the single-step distilled solver (1 DiT call total per chunk, CFG=0). Targets
+    sub-200ms TTFA on a warm pipeline when `s2mel_distilled.pth` is active.
+
+    Only meaningful with a distilled student loaded — on the base teacher CFM this
+    will sound terrible because 1 estimator call at t=0 isn't enough to denoise.
+
+    Mode is PROGRESSIVE_CONTEXT (carries last 30 GPT codes + last 150 mel-cond
+    frames per chunk boundary) — keeps the speaking style continuous instead of
+    resetting per chunk.
+    """
+    return StreamingConfigV2(
+        mode=StreamingMode.PROGRESSIVE_CONTEXT,
+        min_chunk_tokens=60,
+        chunk_tokens=40,
+        max_chunk_tokens=100,
+        first_chunk_diffusion_steps=1,
+        diffusion_steps=1,
+        first_chunk_cfg_rate=0.0,
+        inference_cfg_rate=0.0,
+        solver="single_step",
+        crossfade_samples=512,
+        context_mel_frames_target=150,
+    )
+
+
+def get_balanced_distilled_streaming_config() -> StreamingConfigV2:
+    """Production-recommended distilled config: sentence-level + single_step.
+
+    Mirrors `get_balanced_streaming_config()` but bakes the distilled-student
+    overrides (solver=single_step, 1 step, CFG=0.0). Sentence-sized chunks stay
+    inside the student's training distribution, so quality matches the teacher
+    while TTFA lands ~250-300ms. See docs/STREAMING_LATENCY_RESULTS.md §6.
+
+    Only meaningful with a distilled student loaded.
+    """
+    return StreamingConfigV2(
+        mode=StreamingMode.SENTENCE_LEVEL,
+        split_on_clauses=True,
+        max_sentence_chars=150,
+        diffusion_steps=1,
+        first_chunk_diffusion_steps=1,
+        first_chunk_cfg_rate=0.0,
+        inference_cfg_rate=0.0,
+        solver="single_step",
         crossfade_samples=2048,
     )

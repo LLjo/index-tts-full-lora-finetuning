@@ -17,6 +17,8 @@
             <div class="status-indicator">
                 <span class="status-dot" id="statusDot"></span>
                 <span id="statusText">Connecting...</span>
+                <span id="gpuStatsInline" class="gpu-stats-inline" title="PyTorch reserved / GPU total. Click 🧹 to release allocator cache."></span>
+                <button type="button" class="btn btn-small" id="gpuCleanupBtn" title="Force torch.cuda.empty_cache() + gc.collect()" style="margin-left: 8px;">🧹 Free GPU</button>
             </div>
         </header>
 
@@ -49,13 +51,24 @@
                     <span class="tab-icon">📦</span>
                     Models
                 </button>
+                <button class="tab-button" data-tab="testlab">
+                    <span class="tab-icon">🧪</span>
+                    Test Lab
+                </button>
+                <button class="tab-button" data-tab="distill">
+                    <span class="tab-icon">⚡</span>
+                    Distillation
+                </button>
             </div>
 
             <!-- Inference Tab -->
             <div class="tab-content active" id="inference">
                 <div class="card">
                     <h2>Generate Speech</h2>
-                    
+
+                    <!-- Distilled-student status banner (Phase 3). Hidden until populated. -->
+                    <div id="inferDistillStatus" class="distill-active-banner" style="display: none;"></div>
+
                     <div class="form-group">
                         <label for="inferenceText">Text to Synthesize</label>
                         <textarea id="inferenceText" rows="4" placeholder="Enter the text you want to convert to speech...">Hello, this is a test of the IndexTTS system with pattern embeddings.</textarea>
@@ -158,6 +171,51 @@
                                 </div>
                             </div>
                         </div>
+                    </details>
+
+                    <div class="form-group">
+                        <label for="streamingPreset">Streaming Preset (used by "Stream Speech")</label>
+                        <select id="streamingPreset">
+                            <option value="ultra_fast" selected>ultra_fast — lowest TTFA, teacher CFM</option>
+                            <option value="ultra_fast_distilled">ultra_fast_distilled — sub-200ms TTFA (needs distilled student)</option>
+                            <option value="fast">fast — low TTFA, slightly more compute</option>
+                            <option value="fast_quality">fast_quality — fast TTFA, bigger steady chunks for quality</option>
+                            <option value="balanced">balanced — sentence-level, best quality/latency mix</option>
+                            <option value="balanced_distilled">balanced_distilled — production default (needs distilled student)</option>
+                            <option value="quality">quality — highest quality, slowest</option>
+                            <option value="progressive">progressive — progressive mel context</option>
+                        </select>
+                    </div>
+
+                    <!-- Solver/steps overrides — useful when a distilled student is active. -->
+                    <details class="advanced-options">
+                        <summary>CFM solver overrides (Phase 3)</summary>
+                        <p style="color: #636e72; font-size: 13px;">
+                            Leave blank to use whatever the streaming preset chose. Override when a distilled
+                            student is loaded — typically <code>single_step</code> / 1 step / CFG 0.0.
+                            Click "Use distilled defaults" below for one-click.
+                        </p>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="inferSolverOverride">Solver</label>
+                                <select id="inferSolverOverride">
+                                    <option value="">(use preset)</option>
+                                    <option value="single_step">single_step (distilled)</option>
+                                    <option value="euler">euler</option>
+                                    <option value="heun">heun</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="inferStepsOverride">Diffusion steps</label>
+                                <input type="number" id="inferStepsOverride" min="1" max="30" placeholder="preset" style="width: 100%;">
+                            </div>
+                            <div class="form-group">
+                                <label for="inferCfgOverride">CFG rate</label>
+                                <input type="number" id="inferCfgOverride" min="0" max="2" step="0.1" placeholder="preset" style="width: 100%;">
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-secondary" id="inferDistillDefaultsBtn">⚡ Use distilled defaults</button>
+                        <button type="button" class="btn btn-secondary" id="inferClearOverridesBtn">🧹 Clear overrides</button>
                     </details>
 
                     <div class="button-group">
@@ -276,6 +334,428 @@
                 <div class="card">
                     <h2>Available Speakers</h2>
                     <div id="speakersList" class="speakers-list"></div>
+                </div>
+            </div>
+
+            <!-- Test Lab Tab -->
+            <div class="tab-content" id="testlab">
+                <div class="card">
+                    <h2>Streaming Test Lab</h2>
+                    <p style="color: #636e72; margin-top: -8px;">
+                        Benchmark the Phase 1 / Phase 2 streaming pipeline. Warm up first, then run diagnostics across presets.
+                    </p>
+
+                    <div class="form-group">
+                        <label for="lab-text">Text</label>
+                        <textarea id="lab-text" rows="3">Hello, this is a streaming latency test. The quick brown fox jumps over the lazy dog.</textarea>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="lab-audio">Reference Audio (optional if using a trained speaker)</label>
+                            <div class="file-upload">
+                                <input type="file" id="lab-audio" accept="audio/*">
+                                <span class="file-name" id="lab-audio-name">No file selected</span>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="lab-speaker">Or Trained Speaker</label>
+                            <select id="lab-speaker">
+                                <option value="">None</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="lab-use-patterns">
+                            Use Pattern Embeddings
+                        </label>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="lab-preset">Preset (single run)</label>
+                            <select id="lab-preset">
+                                <option value="ultra_fast">ultra_fast</option>
+                                <option value="ultra_fast_distilled">ultra_fast_distilled</option>
+                                <option value="fast">fast</option>
+                                <option value="fast_quality">fast_quality</option>
+                                <option value="balanced" selected>balanced</option>
+                                <option value="balanced_distilled">balanced_distilled</option>
+                                <option value="quality">quality</option>
+                                <option value="progressive">progressive</option>
+                                <option value="custom">custom</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="lab-runs">Runs per preset (for compare)</label>
+                            <input type="number" id="lab-runs" min="1" max="20" value="3">
+                        </div>
+                    </div>
+
+                    <div class="button-group" style="margin-top: 16px;">
+                        <button class="btn btn-secondary" id="lab-warmup-btn">
+                            <span class="btn-icon">🔥</span> Warm Up (current preset)
+                        </button>
+                        <button class="btn btn-secondary" id="lab-warmup-all-btn">
+                            <span class="btn-icon">🔥🔥</span> Warm Up All Presets
+                        </button>
+                        <button class="btn btn-primary" id="lab-run-btn">
+                            <span class="btn-icon">⏱️</span> Run Diagnostics
+                        </button>
+                        <button class="btn btn-primary" id="lab-compare-btn">
+                            <span class="btn-icon">📊</span> Compare All Presets
+                        </button>
+                    </div>
+
+                    <div id="lab-status" style="margin-top: 12px; color: #2d3436;"></div>
+                </div>
+
+                <div class="card" id="lab-results-card" style="display: none;">
+                    <h2>Results</h2>
+                    <div id="lab-summary" style="margin-bottom: 16px;"></div>
+                    <div style="overflow-x: auto;">
+                        <table id="lab-results-table" style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 13px;">
+                            <thead style="background: #f1f3f5;">
+                                <tr>
+                                    <th style="padding: 8px; text-align: left;">Preset</th>
+                                    <th style="padding: 8px; text-align: right;">TTFA (ms)</th>
+                                    <th style="padding: 8px; text-align: right;">Total (ms)</th>
+                                    <th style="padding: 8px; text-align: right;">Audio (s)</th>
+                                    <th style="padding: 8px; text-align: right;">RTF</th>
+                                    <th style="padding: 8px; text-align: right;">Chunks</th>
+                                    <th style="padding: 8px; text-align: center;">Solver</th>
+                                    <th style="padding: 8px; text-align: center;">Accel</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lab-results-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" id="lab-stages-card" style="display: none;">
+                    <h2>Per-Stage Timeline (last single run)</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Breakdown of where the first-chunk time went. Use this to identify the actual bottleneck.
+                    </p>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 13px;">
+                            <thead style="background: #f1f3f5;">
+                                <tr>
+                                    <th style="padding: 6px; text-align: left;">Stage</th>
+                                    <th style="padding: 6px; text-align: right;">t (ms)</th>
+                                    <th style="padding: 6px; text-align: right;">Δ from previous (ms)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lab-stages-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" id="lab-chunks-card" style="display: none;">
+                    <h2>Per-Chunk Timeline (last single run)</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        <code>since_prev</code> &gt; <code>audio</code> means the player buffer underruns — a gap will be audible.
+                    </p>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 13px;">
+                            <thead style="background: #f1f3f5;">
+                                <tr>
+                                    <th style="padding: 6px; text-align: left;">#</th>
+                                    <th style="padding: 6px; text-align: right;">elapsed (ms)</th>
+                                    <th style="padding: 6px; text-align: right;">since_prev (ms)</th>
+                                    <th style="padding: 6px; text-align: right;">audio (ms)</th>
+                                    <th style="padding: 6px; text-align: right;">samples</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lab-chunks-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Distillation Tab -->
+            <div class="tab-content" id="distill">
+                <div class="card">
+                    <h2>CFM Reflow Distillation (Phase 3)</h2>
+                    <p style="color: #636e72; margin-top: -8px;">
+                        Train a 1-step student CFM from the teacher to drop TTFA from ~300ms to ~150ms.
+                        Each stage builds on the previous — work top to bottom for a new speaker.
+                        See <code>docs/STREAMING_LATENCY_ROADMAP.md</code> Phase 3 for full background.
+                    </p>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-speaker">Speaker</label>
+                            <select id="distill-speaker"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>&nbsp;</label>
+                            <button class="btn btn-secondary" id="distill-refresh-btn">🔄 Refresh status</button>
+                        </div>
+                    </div>
+
+                    <div id="distill-status" class="distill-status"></div>
+                    <div id="distill-active-banner" class="distill-active-banner"></div>
+                </div>
+
+                <!-- Stage 1: Snapshot teacher -->
+                <div class="card distill-stage" id="distill-stage-snapshot">
+                    <h2><span class="stage-badge" data-stage="snapshot">1</span> Snapshot teacher CFM</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Freezes the current S2Mel weights as the distillation reference. With <strong>Merge LoRA</strong>
+                        on, the speaker's S2Mel LoRA is baked in so the teacher already speaks the trained voice —
+                        required if you want the stutter to survive distillation.
+                    </p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label><input type="checkbox" id="distill-merge-lora" checked> Merge speaker's S2Mel LoRA</label>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="distill-snapshot-force"> Overwrite existing snapshot</label>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" id="distill-snapshot-btn">🎯 Snapshot teacher</button>
+                    <div class="task-progress" id="distill-snapshot-progress"></div>
+                </div>
+
+                <!-- Stage 2: Build manifest -->
+                <div class="card distill-stage" id="distill-stage-manifest">
+                    <h2><span class="stage-badge" data-stage="manifest">2</span> Build reflow manifest</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Reads <code>training/&lt;speaker&gt;/dataset/transcripts_verbatim.csv</code> and emits a JSONL of
+                        (id, audio_prompt, text) records. Recommend a single fixed reference audio so the speaker
+                        characteristics stay constant across the dataset.
+                    </p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-manifest-ref">Reference audio (click to pick from speaker's dataset, or type a custom path; blank = per-row)</label>
+                            <input type="text" id="distill-manifest-ref" list="distill-audio-list" placeholder="click to pick or type audio_000.wav">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-manifest-nsamples">z draws per record: <span id="distill-manifest-nsamples-value">4</span></label>
+                            <input type="range" id="distill-manifest-nsamples" min="1" max="8" step="1" value="4">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-manifest-min-dur">Min duration (s): <span id="distill-manifest-min-dur-value">1.0</span></label>
+                            <input type="range" id="distill-manifest-min-dur" min="0" max="5" step="0.5" value="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-manifest-max-dur">Max duration (s): <span id="distill-manifest-max-dur-value">15</span></label>
+                            <input type="range" id="distill-manifest-max-dur" min="5" max="30" step="1" value="15">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-manifest-limit">Record cap (blank = all)</label>
+                            <input type="number" id="distill-manifest-limit" min="1" step="1" placeholder="all">
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" id="distill-manifest-btn">📜 Build manifest from CSV</button>
+                    <div class="task-progress" id="distill-manifest-progress"></div>
+
+                    <details class="advanced-options" style="margin-top: 16px;">
+                        <summary>🤖 Generate synthetic text via Ollama (append to manifest)</summary>
+                        <p style="color: #636e72; font-size: 13px;">
+                            The teacher already speaks in your speaker's voice (LoRA merged in step 1), so what
+                            we actually need is <em>text diversity</em>. Point this at a local Ollama instance,
+                            describe how the speaker talks, and we'll generate N synthetic records that all use
+                            your chosen reference audio. Appended to the existing manifest (run "Build manifest from CSV" first if you want both).
+                        </p>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="distill-ollama-url">Ollama URL</label>
+                                <input type="text" id="distill-ollama-url" value="http://localhost:11434">
+                            </div>
+                            <div class="form-group">
+                                <label for="distill-ollama-model">Model</label>
+                                <select id="distill-ollama-model">
+                                    <option value="">— probe Ollama —</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>&nbsp;</label>
+                                <button type="button" class="btn btn-secondary" id="distill-ollama-probe-btn">🔍 Probe</button>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="distill-style-prompt">Speaker style description</label>
+                            <textarea id="distill-style-prompt" rows="4" placeholder="Describe how the speaker talks. Include vocabulary, accent, fillers, typical topics, energy level, etc. Example:
+'Ozzy Osbourne — gruff working-class Birmingham English, frequent "y'know", "I mean", "f***ing", stutters and false starts. Talks about touring life, family, music history, and absurd anecdotes.'"></textarea>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="distill-syn-num">Records to generate</label>
+                                <input type="number" id="distill-syn-num" min="1" max="2000" value="100">
+                            </div>
+                            <div class="form-group">
+                                <label for="distill-syn-batch">Batch size</label>
+                                <input type="number" id="distill-syn-batch" min="1" max="30" value="10">
+                            </div>
+                            <div class="form-group">
+                                <label for="distill-syn-nsamples">z draws per record: <span id="distill-syn-nsamples-value">4</span></label>
+                                <input type="range" id="distill-syn-nsamples" min="1" max="8" step="1" value="4">
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="distill-syn-min-words">Min words / utterance</label>
+                                <input type="number" id="distill-syn-min-words" min="1" max="100" value="5">
+                            </div>
+                            <div class="form-group">
+                                <label for="distill-syn-max-words">Max words / utterance</label>
+                                <input type="number" id="distill-syn-max-words" min="5" max="100" value="25">
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="distill-syn-extra">Extra constraints (optional)</label>
+                            <input type="text" id="distill-syn-extra" placeholder="e.g. mostly statements, avoid questions, no profanity">
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="distill-syn-ref">Reference audio for all synthetic records (click to pick or type custom path)</label>
+                                <input type="text" id="distill-syn-ref" list="distill-audio-list" placeholder="click to pick (defaults to Stage 2 reference if blank)">
+                            </div>
+                        </div>
+
+                        <datalist id="distill-audio-list"></datalist>
+
+                        <button type="button" class="btn btn-primary" id="distill-syn-btn">🤖 Generate via Ollama</button>
+                        <div class="task-progress" id="distill-syn-progress"></div>
+                    </details>
+                </div>
+
+                <!-- Stage 3: Generate pairs -->
+                <div class="card distill-stage" id="distill-stage-pairs">
+                    <h2><span class="stage-badge" data-stage="pairs">3</span> Generate paired data (slow)</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Runs the teacher CFM at high step count to produce (z, x_final) pairs the student trains on.
+                        Each pair is one full TTS run — budget ~0.5-2 pairs/sec on an A100. <strong>Resumable</strong>:
+                        re-running picks up where it left off.
+                    </p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-pairs-steps">Teacher Euler steps: <span id="distill-pairs-steps-value">50</span></label>
+                            <input type="range" id="distill-pairs-steps" min="10" max="100" step="5" value="50">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-pairs-cfg">Teacher CFG: <span id="distill-pairs-cfg-value">0.7</span></label>
+                            <input type="range" id="distill-pairs-cfg" min="0" max="1.5" step="0.1" value="0.7">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-pairs-nsamples">z draws per record: <span id="distill-pairs-nsamples-value">4</span></label>
+                            <input type="range" id="distill-pairs-nsamples" min="1" max="8" step="1" value="4">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="distill-pairs-limit">Record cap (blank = all)</label>
+                        <input type="number" id="distill-pairs-limit" min="1" step="1" placeholder="all">
+                    </div>
+                    <button class="btn btn-primary" id="distill-pairs-btn">🌀 Generate pairs</button>
+                    <div class="task-progress" id="distill-pairs-progress"></div>
+                </div>
+
+                <!-- Stage 4: Train student -->
+                <div class="card distill-stage" id="distill-stage-train">
+                    <h2><span class="stage-badge" data-stage="train">4</span> Train student CFM (slow)</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Full-weight retrain of the CFM estimator on the paired data, warm-started from base s2mel.
+                        Saves checkpoints every few epochs; <code>best.pth</code> tracks lowest val loss.
+                    </p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-train-epochs">Epochs: <span id="distill-train-epochs-value">40</span></label>
+                            <input type="range" id="distill-train-epochs" min="5" max="200" step="5" value="40">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-train-batch">Batch size: <span id="distill-train-batch-value">4</span></label>
+                            <input type="range" id="distill-train-batch" min="1" max="16" step="1" value="4">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-train-grad-accum">Grad accumulation: <span id="distill-train-grad-accum-value">4</span></label>
+                            <input type="range" id="distill-train-grad-accum" min="1" max="16" step="1" value="4">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-train-lr">Learning rate</label>
+                            <select id="distill-train-lr">
+                                <option value="1e-5">1e-5</option>
+                                <option value="3e-5">3e-5</option>
+                                <option value="5e-5" selected>5e-5 (recommended)</option>
+                                <option value="1e-4">1e-4</option>
+                                <option value="3e-4">3e-4</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>&nbsp;</label>
+                            <label><input type="checkbox" id="distill-train-resume"> Resume from best.pth</label>
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" id="distill-train-btn">🧠 Start training</button>
+                    <div class="task-progress" id="distill-train-progress"></div>
+                </div>
+
+                <!-- Stage 5: A/B eval -->
+                <div class="card distill-stage" id="distill-stage-ab">
+                    <h2><span class="stage-badge" data-stage="ab">5</span> A/B eval — teacher vs student</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Same-seed synthesis with each. Output wavs render below — listen for stutter survival and
+                        general degradation. Mel RMSE is a sanity number, not a verdict.
+                    </p>
+                    <div class="form-group">
+                        <label for="distill-ab-text">Test text</label>
+                        <textarea id="distill-ab-text" rows="3">The patterns were learned from the verbatim transcripts.</textarea>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="distill-ab-student-steps">Student steps: <span id="distill-ab-student-steps-value">1</span></label>
+                            <input type="range" id="distill-ab-student-steps" min="1" max="6" step="1" value="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-ab-student-solver">Student solver</label>
+                            <select id="distill-ab-student-solver">
+                                <option value="single_step" selected>single_step</option>
+                                <option value="euler">euler</option>
+                                <option value="heun">heun</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="distill-ab-teacher-steps">Teacher steps: <span id="distill-ab-teacher-steps-value">10</span></label>
+                            <input type="range" id="distill-ab-teacher-steps" min="5" max="40" step="1" value="10">
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" id="distill-ab-btn">🔬 Run A/B</button>
+                    <div class="task-progress" id="distill-ab-progress"></div>
+                    <div id="distill-ab-result" class="distill-ab-result"></div>
+                </div>
+
+                <!-- Stage 6: Activate -->
+                <div class="card distill-stage" id="distill-stage-activate">
+                    <h2><span class="stage-badge" data-stage="activate">6</span> Activate student</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Copies the student's <code>best.pth</code> to <code>checkpoints/s2mel_distilled.pth</code>.
+                        Restart the API (or call <code>/models/load/base</code>) for it to take effect.
+                        Use <code>solver="single_step"</code> in streaming presets to get the speedup.
+                    </p>
+                    <div class="distill-active-btns">
+                        <button class="btn btn-primary" id="distill-activate-btn">⚡ Activate this speaker's student</button>
+                        <button class="btn btn-secondary" id="distill-deactivate-btn">🛑 Deactivate</button>
+                    </div>
+                    <div class="task-progress" id="distill-activate-progress"></div>
+                </div>
+
+                <!-- Live log tail -->
+                <div class="card" id="distill-log-card" style="display: none;">
+                    <h2>Live log <small id="distill-log-task"></small></h2>
+                    <pre id="distill-log" style="background: #1e1e1e; color: #d4d4d4; padding: 10px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 12px;"></pre>
                 </div>
             </div>
         </main>

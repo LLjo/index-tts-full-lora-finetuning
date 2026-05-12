@@ -17,7 +17,10 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
+    # No @torch.compile: this is a 6-op kernel called once per decoded token.
+    # The dynamo compile here adds capture-time tracing cost AND conflicts with
+    # CUDA-graph capture in AccelInferenceEngine (FX can't trace a dynamo-compiled
+    # function). The end-to-end speed difference is negligible.
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         temperatures = temperatures.to(logits.device).clamp(min=1e-8)
         greedy_mask = temperatures < 1e-5
@@ -79,6 +82,15 @@ class AccelInferenceEngine:
         self.graph_vars = None
         self.graph_pool = None
         self.graph_captured = False
+        # Per-generate capture of decode-time hidden states. The streaming pipeline
+        # can read this to avoid re-running a full GPT forward to extract latents
+        # for S2Mel (Quick Win #3 in docs/STREAMING_LATENCY_ROADMAP.md).
+        # List of [1, hidden_size] tensors, indexed by generated-token position
+        # (entry i = hidden state computed when that token was the input).
+        # IMPORTANT: each entry is a clone of the graph output buffer (which is
+        # reused across decode steps) — readers in other CUDA streams must
+        # synchronize against the default stream before consuming.
+        self.last_decoded_hidden_states: List[torch.Tensor] = []
 
     def _prepare_prefill(self, requests: List[Seq]):
         input_ids = []
@@ -391,6 +403,7 @@ class AccelInferenceEngine:
         tts_text_pos_embedding: Optional[
             torch.nn.Module
         ] = None,  # TTS: text_pos_embedding layer
+        streamer=None,  # HuggingFace-style BaseStreamer: emits tokens as they're sampled
     ) -> torch.Tensor:
         """
         Generate tokens.
@@ -411,6 +424,11 @@ class AccelInferenceEngine:
 
         self._tts_mode = tts_embeddings is not None
         self._tts_prompt_len = input_ids.size(1) if self._tts_mode else 0
+
+        # Reset the per-generate hidden-state buffer used by the streaming pipeline
+        # to skip the redundant S2Mel-latent forward. We only populate this for the
+        # batch_size==1 streaming case; multi-batch use leaves it empty.
+        self.last_decoded_hidden_states = []
 
         if self.use_cuda_graph and not self.graph_captured:
             print(
@@ -549,10 +567,18 @@ class AccelInferenceEngine:
                 sequences[i].append_token(token_id)
                 self.kv_manager.append_to_seq(sequences[i])
 
+        # Streamer: emit the first non-stop token immediately. HF BaseStreamer.put accepts
+        # a tensor; we only stream batch_size==1 (the streaming path always uses that).
+        if streamer is not None and batch_size == 1 and not is_finished[0]:
+            streamer.put(first_token[0].detach())
+
         if all(is_finished):
             for req in sequences:
                 self.kv_manager.remove_seq(req)
             self.current_sequences = []
+
+            if streamer is not None:
+                streamer.end()
 
             output_ids = []
             for i in range(batch_size):
@@ -575,6 +601,14 @@ class AccelInferenceEngine:
                 tts_mel_embedding=tts_mel_embedding,
                 tts_text_pos_embedding=tts_text_pos_embedding,
             )
+
+            # Capture decode-time hidden states for the streaming pipeline. The
+            # underlying buffer is the CUDA-graph output and gets overwritten next
+            # iteration — clone() forks an independent tensor on the default stream.
+            # Index `step` in the buffer corresponds to the token used as INPUT this
+            # iteration, which is also the (step)-th generated token (c_step).
+            if batch_size == 1:
+                self.last_decoded_hidden_states.append(hidden_states.detach().clone())
 
             # Get logits
             if self.lm_head is not None:
@@ -603,8 +637,15 @@ class AccelInferenceEngine:
                     self.kv_manager.append_to_seq(sequences[i])
                     generated_tokens[i].append(token_id)
 
+            # Stream the new token (batch=1 only — the streaming path always uses that).
+            if streamer is not None and batch_size == 1 and not is_finished[0]:
+                streamer.put(next_token[0].detach())
+
             if all(is_finished):
                 break
+
+        if streamer is not None:
+            streamer.end()
 
         for req in sequences:
             self.kv_manager.remove_seq(req)
@@ -646,10 +687,12 @@ class AccelInferenceEngine:
 
 
 class Sampler(nn.Module):
+    """Duplicate of the Sampler defined above. Kept (without @torch.compile) so the
+    module's class binding remains the simpler form some upstream code expects.
+    See the comment on the first Sampler for why torch.compile is not used here."""
     def __init__(self):
         super().__init__()
 
-    @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))
         probs = torch.softmax(logits, dim=-1)

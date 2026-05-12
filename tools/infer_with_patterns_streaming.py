@@ -382,12 +382,15 @@ def pattern_aware_inference_streaming(
     top_p: float = 0.8,
     top_k: int = 30,
     max_mel_tokens: int = 600,
-    # Streaming config
+    # Streaming config — if `config` is provided it wins; otherwise these scalars are used.
     min_chunk_tokens: int = 15,
     chunk_tokens: int = 50,
     diffusion_steps: int = 12,
     first_chunk_diffusion_steps: int = 6,
     verbose: bool = False,
+    config: Optional['StreamingConfigV2'] = None,
+    timing_log: Optional[list] = None,
+    cond_cache_key: Optional[str] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     True streaming inference with pattern embedding injection.
@@ -424,26 +427,21 @@ def pattern_aware_inference_streaming(
     Yields:
         Audio chunks as torch.Tensor (1, samples) at 22050 Hz
     """
-    from indextts.streaming_v2 import streaming_inference_v2, StreamingConfigV2, StreamingMode, get_fast_streaming_config, get_balanced_streaming_config
-    
-    # StreamingConfigV2(
-    #     # min_chunk_tokens=min_chunk_tokens,
-    #     # chunk_tokens=chunk_tokens,
-    #     # diffusion_steps=diffusion_steps,
-    #     # first_chunk_diffusion_steps=first_chunk_diffusion_steps,
-    #     inference_cfg_rate=0.7,
-    #     split_on_clauses=True,
-    #     verbose=True
-    # )
-    config = StreamingConfigV2(
-        mode=StreamingMode.PROGRESSIVE_CONTEXT,
-        diffusion_steps=20,
-        first_chunk_diffusion_steps=6,
-        crossfade_samples=2048,
-        min_chunk_tokens=130,
-        verbose=True,
-        chunk_tokens=80
-    )
+    from indextts.streaming_v2 import streaming_inference_v2, StreamingConfigV2, StreamingMode
+
+    if config is None:
+        # Legacy default: progressive context with conservative chunking.
+        # Callers wanting Phase 1 latency wins should pass a config built from
+        # get_fast_streaming_config() or get_ultra_fast_streaming_config().
+        config = StreamingConfigV2(
+            mode=StreamingMode.PROGRESSIVE_CONTEXT,
+            diffusion_steps=diffusion_steps,
+            first_chunk_diffusion_steps=first_chunk_diffusion_steps,
+            crossfade_samples=2048,
+            min_chunk_tokens=min_chunk_tokens,
+            chunk_tokens=chunk_tokens,
+            verbose=verbose,
+        )
     
     # Stream with pattern embedding injection
     yield from streaming_inference_v2(
@@ -464,6 +462,8 @@ def pattern_aware_inference_streaming(
         top_p=top_p,
         top_k=top_k,
         max_mel_tokens=max_mel_tokens,
+        timing_log=timing_log,
+        cond_cache_key=cond_cache_key,
     )
 
 

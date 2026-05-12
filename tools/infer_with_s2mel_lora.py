@@ -289,9 +289,11 @@ def main():
         reference = find_reference_audio(args.speaker)
     
     # ----------------------------------------------------------------------
-    # New logic: Prefer stored speaker embeddings if no reference audio is found.
-    # This enables prompt‑less inference using the embeddings extracted during
-    # training (training/<speaker>/embeddings/speaker_embeddings.pt).
+    # Updated logic: Prefer stored speaker embeddings whenever they are
+    # available, regardless of whether a reference audio file is also
+    # provided.  This ensures that GPT‑aligned training (which relies on
+    # the stored speaker embeddings) is used correctly and avoids the
+    # “drunk/mumbling” output caused by mismatched reference conditioning.
     # ----------------------------------------------------------------------
     speaker_embeddings_path = (
         Path(__file__).parent.parent
@@ -302,9 +304,10 @@ def main():
     )
     
     use_speaker_embeddings = False
-    if (reference is None or not reference.exists()) and speaker_embeddings_path.exists():
+    # If stored speaker embeddings exist, use them regardless of reference audio.
+    if speaker_embeddings_path.exists():
         use_speaker_embeddings = True
-        print(f"  No reference audio found – loading stored speaker embeddings from {speaker_embeddings_path}")
+        print(f"  Using stored speaker embeddings from {speaker_embeddings_path}")
     
     if not use_speaker_embeddings and (reference is None or not reference.exists()):
         print("Reference audio not found!")

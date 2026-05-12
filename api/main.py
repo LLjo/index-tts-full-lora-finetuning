@@ -29,7 +29,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from indextts.infer_v2 import IndexTTS2
 from indextts.pattern_embeddings import PatternEmbedding
-from indextts.streaming_v2 import streaming_inference_v2, StreamingConfigV2
+from indextts.streaming_v2 import (
+    streaming_inference_v2,
+    StreamingConfigV2,
+    StreamingMode,
+    get_fast_streaming_config,
+    get_fast_quality_streaming_config,
+    get_ultra_fast_streaming_config,
+    get_ultra_fast_distilled_streaming_config,
+    get_balanced_streaming_config,
+    get_balanced_distilled_streaming_config,
+    get_quality_streaming_config,
+    get_progressive_streaming_config,
+)
 from tools.infer_with_patterns import pattern_aware_inference, pattern_aware_inference_streaming
 
 # Global state
@@ -90,6 +102,20 @@ class StreamTTSRequest(BaseModel):
     chunk_tokens: int = Field(50, ge=20, le=100, description="Tokens per subsequent chunk")
     diffusion_steps: int = Field(12, ge=4, le=30, description="Diffusion steps (lower = faster)")
     first_chunk_diffusion_steps: int = Field(6, ge=2, le=15, description="Diffusion steps for first chunk")
+    # Latency/quality preset. "ultra_fast" / "fast" pick Phase 1 optimized configs (Heun
+    # solver + CFG=0 first chunk + small min_chunk_tokens). When set to anything other
+    # than "custom", the scalar knobs above are ignored.
+    streaming_preset: str = Field(
+        "ultra_fast",
+        description="One of: ultra_fast, ultra_fast_distilled, fast, fast_quality, balanced, balanced_distilled, quality, progressive, custom",
+    )
+    verbose: bool = Field(True, description="Log per-stage timing on the server (for TTFA debugging)")
+    # Overrides applied AFTER the preset is built. Use these from the Inference tab to
+    # force a specific solver (e.g. "single_step" when a distilled student is active)
+    # without having to wire up a separate "custom" preset.
+    solver_override: Optional[str] = Field(None, description="If set, replaces the preset's solver. One of: euler, heun, single_step.")
+    diffusion_steps_override: Optional[int] = Field(None, ge=1, le=50, description="If set, replaces the preset's diffusion_steps AND first_chunk_diffusion_steps (use 1 for distilled student).")
+    inference_cfg_override: Optional[float] = Field(None, ge=0.0, le=2.0, description="If set, replaces the preset's CFG rate (use 0.0 for distilled student).")
 
 
 class TrainingRequest(BaseModel):
@@ -245,20 +271,38 @@ async def load_model(speaker_name: str):
         model_dir = PROJECT_ROOT / "checkpoints"
         if not model_dir.exists():
             raise HTTPException(status_code=404, detail="Checkpoints directory not found")
-        
+
+        # Phase 3: optionally overlay a distilled CFM. Two ways to wire it in:
+        #   1. env var S2MEL_DISTILLED_CHECKPOINT=/abs/path/to/checkpoint.pth
+        #   2. drop a file at checkpoints/s2mel_distilled.pth — auto-detected
+        # The student is loaded on top of the base s2mel; only keys it contains
+        # (typically the "cfm" submodule) are replaced.
+        distilled_ckpt: Optional[str] = os.environ.get("S2MEL_DISTILLED_CHECKPOINT") or None
+        if distilled_ckpt is None:
+            auto_path = model_dir / "s2mel_distilled.pth"
+            if auto_path.exists():
+                distilled_ckpt = str(auto_path)
+
         try:
             print("🚀 Loading IndexTTS2 base model...")
+            if distilled_ckpt:
+                print(f"   with distilled CFM: {distilled_ckpt}")
             tts_model = IndexTTS2(
                 model_dir=str(model_dir),
                 use_fp16=torch.cuda.is_available(),
                 use_cuda_kernel=torch.cuda.is_available(),
                 use_accel=True,
                 use_deepspeed=True,
-                use_torch_compile=True
+                use_torch_compile=True,
+                s2mel_distilled_checkpoint=distilled_ckpt,
             )
             loaded_models.clear()
             print("✅ IndexTTS2 base model loaded successfully")
-            return {"status": "success", "message": "Base model loaded successfully"}
+            return {
+                "status": "success",
+                "message": "Base model loaded successfully",
+                "distilled_cfm": distilled_ckpt,
+            }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load base model: {str(e)}")
     
@@ -364,6 +408,59 @@ async def generate_speech(
                 pass
 
 
+def _build_streaming_config(request: "StreamTTSRequest") -> StreamingConfigV2:
+    """Map a StreamTTSRequest to a StreamingConfigV2.
+
+    Presets pull from indextts.streaming_v2 helpers. "custom" honors the scalar fields
+    on the request so the WebUI's manual sliders still work.
+    """
+    preset = (request.streaming_preset or "ultra_fast").lower()
+    if preset == "ultra_fast":
+        config = get_ultra_fast_streaming_config()
+    elif preset == "ultra_fast_distilled":
+        config = get_ultra_fast_distilled_streaming_config()
+    elif preset == "fast":
+        config = get_fast_streaming_config()
+    elif preset == "fast_quality":
+        config = get_fast_quality_streaming_config()
+    elif preset == "balanced":
+        config = get_balanced_streaming_config()
+    elif preset == "balanced_distilled":
+        config = get_balanced_distilled_streaming_config()
+    elif preset == "quality":
+        config = get_quality_streaming_config()
+    elif preset == "progressive":
+        config = get_progressive_streaming_config()
+    elif preset == "custom":
+        config = StreamingConfigV2(
+            mode=StreamingMode.FAST_CHUNKS,
+            min_chunk_tokens=request.min_chunk_tokens,
+            chunk_tokens=request.chunk_tokens,
+            diffusion_steps=request.diffusion_steps,
+            first_chunk_diffusion_steps=request.first_chunk_diffusion_steps,
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown streaming_preset: {preset}")
+    # `verbose` is only on StreamTTSRequest, not WarmupRequest — getattr keeps the
+    # helper usable for both. Defaults to True so server logs are populated.
+    config.verbose = bool(getattr(request, "verbose", True))
+
+    # Apply optional overrides (so e.g. the Inference tab can force single_step + 1 step
+    # when a distilled student is loaded, regardless of the chosen preset).
+    solver_override = getattr(request, "solver_override", None)
+    if solver_override:
+        config.solver = solver_override
+    steps_override = getattr(request, "diffusion_steps_override", None)
+    if steps_override is not None:
+        config.diffusion_steps = int(steps_override)
+        config.first_chunk_diffusion_steps = int(steps_override)
+    cfg_override = getattr(request, "inference_cfg_override", None)
+    if cfg_override is not None:
+        config.inference_cfg_rate = float(cfg_override)
+        config.first_chunk_cfg_rate = float(cfg_override)
+    return config
+
+
 @app.post("/inference/stream")
 async def stream_speech(
     audio_file: Optional[UploadFile] = File(None, description="Speaker reference audio (optional when using patterns)"),
@@ -409,46 +506,48 @@ async def stream_speech(
             # Load speaker embeddings and pattern embedding if using patterns
             speaker_embeddings = None
             pattern_embedding = None
-            
+            cond_cache_key: Optional[str] = None
+
             if request.use_patterns and request.speaker:
                 speaker_dir = PROJECT_ROOT / "training" / request.speaker
-                
+
                 # Load pattern embedding
                 pattern_path = speaker_dir / "pattern_training" / "best_checkpoint" / "pattern_embedding.pt"
                 if not pattern_path.exists():
                     pattern_path = speaker_dir / "pattern_training" / "final_checkpoint" / "pattern_embedding.pt"
-                
+
                 if pattern_path.exists():
                     pattern_embedding = PatternEmbedding.load(pattern_path, device=tts_model.device)
                     pattern_embedding.eval()
                 # Load speaker embeddings if no audio file
                 if tmp_audio_path is None:
                     from indextts.speaker_embeddings import SpeakerEmbeddingStore
-                    
+
                     speaker_emb_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
-                    
+
                     if speaker_emb_path.exists():
                         store = SpeakerEmbeddingStore(tts_model)
                         speaker_embeddings = store.load_embeddings(speaker_emb_path)
+                        cond_cache_key = str(speaker_emb_path)
                     else:
                         yield b"Error: Speaker embeddings not found"
                         return
             
-            # Configure streaming for optimal TTFA
-            # config = StreamingConfig(
-            #     min_chunk_tokens=request.min_chunk_tokens,
-            #     chunk_tokens=request.chunk_tokens,
-            #     diffusion_steps=request.diffusion_steps,
-            #     first_chunk_diffusion_steps=request.first_chunk_diffusion_steps,
-            #     inference_cfg_rate=0.7,
-            #     synthesize_during_generation=True,
-            #     verbose=False,
-            # )
-            
-            # Stream using optimized streaming module with pattern embedding support
+            # Build streaming config from the requested preset
+            stream_config = _build_streaming_config(request)
+            print(
+                f"[stream] preset={request.streaming_preset} "
+                f"mode={stream_config.mode.value} "
+                f"min_chunk_tokens={stream_config.min_chunk_tokens} "
+                f"first_steps={stream_config.first_chunk_diffusion_steps} "
+                f"solver={stream_config.solver} "
+                f"first_cfg={stream_config.first_chunk_cfg_rate}",
+                flush=True,
+            )
+
             chunk_idx = 0
             header_sent = False
-            
+
             for wav_chunk in pattern_aware_inference_streaming(
                 tts=tts_model,
                 text=request.text,
@@ -458,11 +557,12 @@ async def stream_speech(
                 emo_vector=request.emo_vector,
                 use_emo_text=request.use_emo_text,
                 emo_text=request.emo_text,
-                # config=config,
-                pattern_embedding=pattern_embedding,  # Pass pattern embedding
+                config=stream_config,
+                pattern_embedding=pattern_embedding,
                 temperature=request.temperature,
                 top_p=request.top_p,
                 top_k=request.top_k,
+                cond_cache_key=cond_cache_key,
             ):
                 # Ensure chunk has correct shape
                 if wav_chunk.dim() == 1:
@@ -498,6 +598,301 @@ async def stream_speech(
                     pass
     
     return StreamingResponse(generate_chunks(), media_type="audio/wav")
+
+
+# ============= Phase 2 testing helpers =============
+
+
+class WarmupRequest(BaseModel):
+    """Warm up the streaming pipeline (CUDA graph capture, torch.compile JIT, BigVGAN
+    kernel init). Run once after model load before measuring TTFA.
+
+    Use realistic text — the warmup needs to hit chunk_tokens-sized synthesis (~40
+    tokens, ~70 mel frames) so CUDA graphs and torch.compile specialize for the
+    shapes the real benchmark will use. A 3-token toy warmup misses this.
+    """
+    speaker: Optional[str] = Field(None, description="Speaker name (uses stored embeddings)")
+    use_patterns: bool = Field(False, description="Use pattern embeddings if available")
+    text: str = Field(
+        "Hello, this is a warmup pass to capture CUDA graphs and just-in-time compile "
+        "the diffusion model against realistic chunk shapes before benchmarking.",
+        description="Warmup text. Should be long enough to trigger multiple full-size chunks.",
+    )
+    streaming_preset: str = Field("ultra_fast", description="Single preset to warm up with (used if `presets` is empty)")
+    presets: List[str] = Field(
+        default_factory=list,
+        description="Optional list of presets to warm in sequence. If non-empty, overrides streaming_preset.",
+    )
+
+
+@app.post("/inference/warmup")
+async def warmup(
+    audio_file: Optional[UploadFile] = File(None),
+    request_json: str = Form(...),
+):
+    """Run a one-shot streaming synthesis to warm up the pipeline.
+
+    The very first request after model load pays the cost of:
+      - AccelInferenceEngine CUDA graph capture (~1-2s)
+      - torch.compile JIT for CFM (~5-10s if use_torch_compile=True)
+      - BigVGAN CUDA kernel init (~100-500ms)
+
+    This endpoint eats those costs upfront so the first real request hits warm caches.
+    Returns timing info; the audio itself is discarded.
+    """
+    if tts_model is None:
+        raise HTTPException(status_code=503, detail="TTS model not loaded")
+
+    try:
+        request = WarmupRequest.parse_raw(request_json)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
+
+    if not request.use_patterns and audio_file is None and not request.speaker:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide audio_file, speaker (with use_patterns), or both",
+        )
+
+    tmp_audio_path = None
+    if audio_file is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            shutil.copyfileobj(audio_file.file, tmp)
+            tmp_audio_path = tmp.name
+
+    speaker_embeddings = None
+    pattern_embedding = None
+    cond_cache_key: Optional[str] = None
+    try:
+        if request.use_patterns and request.speaker:
+            speaker_dir = PROJECT_ROOT / "training" / request.speaker
+            pattern_path = speaker_dir / "pattern_training" / "best_checkpoint" / "pattern_embedding.pt"
+            if not pattern_path.exists():
+                pattern_path = speaker_dir / "pattern_training" / "final_checkpoint" / "pattern_embedding.pt"
+            if pattern_path.exists():
+                pattern_embedding = PatternEmbedding.load(pattern_path, device=tts_model.device)
+                pattern_embedding.eval()
+            if tmp_audio_path is None:
+                from indextts.speaker_embeddings import SpeakerEmbeddingStore
+                speaker_emb_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
+                if speaker_emb_path.exists():
+                    store = SpeakerEmbeddingStore(tts_model)
+                    speaker_embeddings = store.load_embeddings(speaker_emb_path)
+                    cond_cache_key = str(speaker_emb_path)
+                else:
+                    raise HTTPException(status_code=404, detail="Speaker embeddings not found")
+
+        # Build the list of presets to warm. CUDA graphs are captured per-shape, and
+        # CFM's torch.compile may re-JIT for different chunk sizes, so warming each
+        # preset separately gives the cleanest benchmarking baseline.
+        presets_to_warm = request.presets if request.presets else [request.streaming_preset]
+
+        import time as _time
+        per_preset = []
+        overall_start = _time.perf_counter()
+
+        for preset_name in presets_to_warm:
+            # Mutate `request` so _build_streaming_config picks up this preset.
+            request.streaming_preset = preset_name
+            stream_config = _build_streaming_config(request)
+            stream_config.verbose = True
+
+            t_start = _time.perf_counter()
+            t_first_chunk = None
+            chunk_count = 0
+            total_audio_samples = 0
+
+            for wav_chunk in pattern_aware_inference_streaming(
+                tts=tts_model,
+                text=request.text,
+                audio_prompt=tmp_audio_path,
+                speaker_embeddings=speaker_embeddings,
+                config=stream_config,
+                pattern_embedding=pattern_embedding,
+                cond_cache_key=cond_cache_key,
+            ):
+                if t_first_chunk is None:
+                    t_first_chunk = _time.perf_counter() - t_start
+                chunk_count += 1
+                total_audio_samples += wav_chunk.shape[-1]
+
+            per_preset.append({
+                "preset": preset_name,
+                "ttfa_ms": round((t_first_chunk or 0) * 1000, 1),
+                "total_time_ms": round((_time.perf_counter() - t_start) * 1000, 1),
+                "chunks": chunk_count,
+                "audio_seconds": round(total_audio_samples / 22050.0, 3),
+            })
+
+        total_elapsed = _time.perf_counter() - overall_start
+
+        # Backwards-compatible top-level fields for the single-preset case + a per-preset breakdown.
+        first = per_preset[0] if per_preset else {}
+        return {
+            "status": "warmed_up",
+            "preset": first.get("preset"),
+            "ttfa_ms": first.get("ttfa_ms"),
+            "total_time_ms": first.get("total_time_ms"),
+            "chunks": first.get("chunks"),
+            "audio_seconds": first.get("audio_seconds"),
+            "presets_warmed": per_preset,
+            "overall_time_ms": round(total_elapsed * 1000, 1),
+            "message": (
+                "Pipeline is warm. CUDA graphs captured, kernels initialized."
+                if len(per_preset) == 1
+                else f"Warmed {len(per_preset)} presets in {total_elapsed:.1f}s."
+            ),
+        }
+    finally:
+        if tmp_audio_path is not None:
+            try:
+                os.unlink(tmp_audio_path)
+            except OSError:
+                pass
+
+
+@app.post("/inference/stream/diagnostics")
+async def stream_diagnostics(
+    audio_file: Optional[UploadFile] = File(None),
+    request_json: str = Form(...),
+):
+    """Run a streaming synthesis and return JSON timing breakdown instead of audio.
+
+    Same request format as /inference/stream — accepts the full StreamTTSRequest.
+    Useful for benchmarking TTFA + steady-state cadence without parsing WAV bytes.
+    """
+    if tts_model is None:
+        raise HTTPException(status_code=503, detail="TTS model not loaded")
+
+    try:
+        request = StreamTTSRequest.parse_raw(request_json)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
+
+    if not request.use_patterns and audio_file is None:
+        raise HTTPException(status_code=400, detail="audio_file is required when not using patterns")
+
+    tmp_audio_path = None
+    if audio_file is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            shutil.copyfileobj(audio_file.file, tmp)
+            tmp_audio_path = tmp.name
+
+    speaker_embeddings = None
+    pattern_embedding = None
+    cond_cache_key: Optional[str] = None
+    try:
+        if request.use_patterns and request.speaker:
+            speaker_dir = PROJECT_ROOT / "training" / request.speaker
+            pattern_path = speaker_dir / "pattern_training" / "best_checkpoint" / "pattern_embedding.pt"
+            if not pattern_path.exists():
+                pattern_path = speaker_dir / "pattern_training" / "final_checkpoint" / "pattern_embedding.pt"
+            if pattern_path.exists():
+                pattern_embedding = PatternEmbedding.load(pattern_path, device=tts_model.device)
+                pattern_embedding.eval()
+            if tmp_audio_path is None:
+                from indextts.speaker_embeddings import SpeakerEmbeddingStore
+                speaker_emb_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
+                if speaker_emb_path.exists():
+                    store = SpeakerEmbeddingStore(tts_model)
+                    speaker_embeddings = store.load_embeddings(speaker_emb_path)
+                    cond_cache_key = str(speaker_emb_path)
+                else:
+                    raise HTTPException(status_code=404, detail="Speaker embeddings not found")
+
+        stream_config = _build_streaming_config(request)
+
+        import time as _time
+        t_start = _time.perf_counter()
+        chunk_timings = []
+        total_audio_samples = 0
+        last_t = t_start
+        timing_events: list = []
+
+        for wav_chunk in pattern_aware_inference_streaming(
+            tts=tts_model,
+            text=request.text,
+            audio_prompt=tmp_audio_path,
+            speaker_embeddings=speaker_embeddings,
+            emotion_audio=None,
+            emo_vector=request.emo_vector,
+            use_emo_text=request.use_emo_text,
+            emo_text=request.emo_text,
+            config=stream_config,
+            pattern_embedding=pattern_embedding,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
+            timing_log=timing_events,
+            cond_cache_key=cond_cache_key,
+        ):
+            now = _time.perf_counter()
+            samples = int(wav_chunk.shape[-1])
+            chunk_timings.append({
+                "elapsed_ms": round((now - t_start) * 1000, 1),
+                "since_prev_ms": round((now - last_t) * 1000, 1),
+                "samples": samples,
+                "audio_ms": round(samples / 22.050, 1),
+            })
+            total_audio_samples += samples
+            last_t = now
+
+        t_total = _time.perf_counter() - t_start
+        audio_seconds = total_audio_samples / 22050.0
+
+        # Derive a per-stage summary from the raw event log. This is what tells us
+        # where the first-chunk time actually goes (setup vs prefill vs synth vs ...).
+        def _t(event_name, chunk_idx=None):
+            for ev in timing_events:
+                if ev["event"] == event_name and (chunk_idx is None or ev.get("chunk_idx") == chunk_idx):
+                    return ev["t_ms"]
+            return None
+
+        stages = {
+            "request_start_ms":            _t("request_start"),
+            "conditioning_done_ms":        _t("conditioning_done"),
+            "threads_starting_ms":         _t("threads_starting"),
+            "gpt_first_token_ms":          _t("gpt_first_token"),
+            "chunk1_dispatched_ms":        _t("chunk_dispatched", 1),
+            "chunk1_synth_start_ms":       _t("synth_start", 1),
+            "chunk1_gpt_latent_done_ms":   _t("synth_gpt_latent_done", 1),
+            "chunk1_length_reg_done_ms":   _t("synth_length_reg_done", 1),
+            "chunk1_cfm_done_ms":          _t("synth_cfm_done", 1),
+            "chunk1_bigvgan_done_ms":      _t("synth_bigvgan_done", 1),
+            "chunk1_synth_done_ms":        _t("synth_done", 1),
+            "chunk1_yielded_ms":           _t("chunk_yielded", 1),
+            "chunk2_dispatched_ms":        _t("chunk_dispatched", 2),
+            "chunk2_synth_start_ms":       _t("synth_start", 2),
+            "chunk2_gpt_latent_done_ms":   _t("synth_gpt_latent_done", 2),
+            "chunk2_length_reg_done_ms":   _t("synth_length_reg_done", 2),
+            "chunk2_cfm_done_ms":          _t("synth_cfm_done", 2),
+            "chunk2_bigvgan_done_ms":      _t("synth_bigvgan_done", 2),
+            "chunk2_synth_done_ms":        _t("synth_done", 2),
+            "chunk2_yielded_ms":           _t("chunk_yielded", 2),
+        }
+
+        return {
+            "preset": request.streaming_preset,
+            "solver": stream_config.solver,
+            "first_chunk_cfg_rate": stream_config.first_chunk_cfg_rate,
+            "min_chunk_tokens": stream_config.min_chunk_tokens,
+            "first_chunk_diffusion_steps": stream_config.first_chunk_diffusion_steps,
+            "ttfa_ms": chunk_timings[0]["elapsed_ms"] if chunk_timings else None,
+            "total_time_ms": round(t_total * 1000, 1),
+            "audio_seconds": round(audio_seconds, 3),
+            "rtf": round(t_total / audio_seconds, 3) if audio_seconds > 0 else None,
+            "chunk_count": len(chunk_timings),
+            "accel_engine_active": getattr(tts_model.gpt, "accel_engine", None) is not None,
+            "chunks": chunk_timings,
+            "stages": stages,
+            "events": timing_events,
+        }
+    finally:
+        if tmp_audio_path is not None:
+            try:
+                os.unlink(tmp_audio_path)
+            except OSError:
+                pass
 
 
 async def generate_with_patterns(
@@ -771,6 +1166,922 @@ async def list_speakers():
             })
     
     return speakers
+
+
+# ============= Phase 3: Reflow distillation =============
+#
+# Each distillation stage (snapshot teacher / build manifest / generate pairs /
+# train student / A/B eval / activate) is exposed as an endpoint. Long-running
+# stages spawn subprocesses of the corresponding tools/*.py script and stream
+# progress back via the shared `distillation_tasks` registry.
+
+distillation_tasks: Dict[str, Dict[str, Any]] = {}
+
+
+def _teacher_path(speaker: str) -> Path:
+    """Per-voice teacher snapshot path. The plain default is reserved for the base."""
+    return PROJECT_ROOT / "checkpoints" / f"s2mel_teacher_{speaker}.pth"
+
+
+def _pairs_dir(speaker: str) -> Path:
+    return PROJECT_ROOT / "training" / speaker / "reflow_pairs"
+
+
+def _manifest_path(speaker: str) -> Path:
+    return PROJECT_ROOT / "training" / speaker / "reflow_manifest.jsonl"
+
+
+def _student_path(speaker: str) -> Path:
+    return PROJECT_ROOT / "training" / speaker / "cfm_reflow_student" / "best.pth"
+
+
+def _active_student_path() -> Path:
+    return PROJECT_ROOT / "checkpoints" / "s2mel_distilled.pth"
+
+
+def _count_pair_files(speaker: str) -> int:
+    d = _pairs_dir(speaker)
+    if not d.exists():
+        return 0
+    return sum(1 for _ in d.glob("*.pt"))
+
+
+def _lora_path_for_speaker(speaker: str) -> Optional[Path]:
+    """Find an S2Mel LoRA for the speaker, if any. Used by the snapshot-teacher
+    flow to bake the trained patterns into the teacher before distillation."""
+    base = PROJECT_ROOT / "training" / speaker
+    for candidate in (
+        base / "s2mel_lora" / "best_checkpoint",
+        base / "s2mel_lora" / "final_checkpoint",
+        base / "lora",
+    ):
+        if candidate.exists() and (candidate / "adapter_config.json").exists():
+            return candidate
+    return None
+
+
+def _new_distill_task(task_type: str, speaker: str) -> str:
+    task_id = f"distill_{task_type}_{speaker}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
+    distillation_tasks[task_id] = {
+        "type": task_type,
+        "speaker_name": speaker,
+        "status": "queued",
+        "progress": 0.0,
+        "message": "Queued",
+        "log": [],
+        "started_at": datetime.now().isoformat(),
+        "completed_at": None,
+        "pid": None,
+    }
+    return task_id
+
+
+def _run_distill_subprocess(
+    task_id: str,
+    cmd: List[str],
+    log_max_lines: int = 500,
+    progress_parser=None,
+) -> None:
+    """Run a tools/*.py subprocess and stream stdout into the task log buffer.
+
+    progress_parser is an optional callable(line: str, task: dict) -> None that
+    inspects each log line and may set task['progress'] and task['message'].
+    Keeps things flexible per-stage without hardcoding regexes here.
+    """
+    import subprocess
+
+    task = distillation_tasks[task_id]
+    task["status"] = "running"
+    task["message"] = "Started"
+    task["progress"] = 0.01
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        task["pid"] = process.pid
+
+        for line in process.stdout:  # type: ignore[union-attr]
+            line = line.rstrip()
+            print(f"[{task_id}] {line}", flush=True)
+            log = task["log"]
+            log.append(line)
+            if len(log) > log_max_lines:
+                # Drop the oldest entries; keep tail.
+                del log[: len(log) - log_max_lines]
+            if progress_parser is not None:
+                try:
+                    progress_parser(line, task)
+                except Exception:
+                    pass
+
+        process.wait()
+        task["pid"] = None
+
+        if process.returncode == 0:
+            task["status"] = "completed"
+            task["progress"] = 1.0
+            task["message"] = "Done"
+        else:
+            task["status"] = "failed"
+            task["message"] = f"Exited with code {process.returncode}"
+        task["completed_at"] = datetime.now().isoformat()
+
+    except Exception as e:
+        task["status"] = "failed"
+        task["message"] = f"Crashed: {e}"
+        task["completed_at"] = datetime.now().isoformat()
+        task["pid"] = None
+
+
+# ---- Pydantic models for the endpoints ----
+
+class DistillSnapshotRequest(BaseModel):
+    speaker: str
+    merge_lora: bool = Field(True, description="Bake the S2Mel LoRA into the teacher (recommended for per-voice student).")
+    force: bool = Field(False, description="Overwrite an existing teacher snapshot.")
+
+
+class DistillManifestRequest(BaseModel):
+    speaker: str
+    reference_audio: Optional[str] = Field(None, description="Optional path under training/<speaker>/dataset/audio (or absolute).")
+    reference_from_row: bool = Field(False, description="If true, each row uses its own audio as reference. Mutually exclusive with reference_audio.")
+    n_samples: int = Field(4, ge=1, le=16, description="How many z draws per record to request at pair-gen time.")
+    min_duration: float = Field(1.0, ge=0.0)
+    max_duration: float = Field(15.0, ge=1.0, le=60.0)
+    limit: Optional[int] = Field(None, description="Cap manifest size (smoke test).")
+
+
+class DistillSyntheticManifestRequest(BaseModel):
+    speaker: str
+    reference_audio: str = Field(..., description="Path under training/<speaker>/dataset/audio or absolute. Required for synthetic records.")
+    style_prompt: str = Field(..., description="Free-text description of how the speaker talks (used as system prompt for Ollama).")
+    num_records: int = Field(50, ge=1, le=2000, description="How many text records to generate and append.")
+    n_samples: int = Field(4, ge=1, le=16, description="Per-record z draws for downstream pair generation.")
+    ollama_url: str = Field("http://localhost:11434", description="Base URL of the Ollama HTTP API.")
+    ollama_model: str = Field("llama3.2", description="Ollama model name (must be pulled on the Ollama host).")
+    batch_size: int = Field(10, ge=1, le=30, description="How many records to ask Ollama for per call.")
+    min_words: int = Field(5, ge=1)
+    max_words: int = Field(25, ge=5, le=100)
+    extra_instructions: Optional[str] = Field(None, description="Optional appended user instruction (e.g. topic constraints).")
+
+
+class DistillPairsRequest(BaseModel):
+    speaker: str
+    teacher_steps: int = Field(50, ge=10, le=200)
+    teacher_cfg: float = Field(0.7, ge=0.0, le=2.0)
+    n_samples: int = Field(4, ge=1, le=16)
+    limit: Optional[int] = Field(None, description="Process only first N manifest records.")
+
+
+class DistillTrainRequest(BaseModel):
+    speaker: str
+    epochs: int = Field(40, ge=1, le=400)
+    batch_size: int = Field(4, ge=1, le=64)
+    grad_accumulation: int = Field(4, ge=1, le=64)
+    learning_rate: float = Field(5e-5, gt=0)
+    val_split: float = Field(0.02, ge=0.0, le=0.5)
+    save_every_epochs: int = Field(2, ge=1, le=50)
+    resume: bool = Field(False, description="Resume from this speaker's best.pth if present.")
+
+
+class DistillAbRequest(BaseModel):
+    speaker: str
+    text: str
+    student_steps: int = Field(1, ge=1, le=20)
+    student_solver: str = Field("single_step")
+    teacher_steps: int = Field(10, ge=1, le=50)
+    teacher_solver: str = Field("heun")
+    reference_audio: Optional[str] = None
+
+
+class DistillActivateRequest(BaseModel):
+    speaker: str
+
+
+# ---- Endpoints ----
+
+
+@app.get("/distill/speakers")
+async def distill_list_speakers():
+    """List speakers + pipeline state for each stage. Drives the UI."""
+    training_dir = PROJECT_ROOT / "training"
+    out: List[Dict[str, Any]] = []
+    active_student = _active_student_path()
+    active_exists = active_student.exists()
+    active_size = active_student.stat().st_size if active_exists else 0
+
+    if training_dir.exists():
+        for sp in sorted(p for p in training_dir.iterdir() if p.is_dir()):
+            name = sp.name
+            teacher = _teacher_path(name)
+            manifest = _manifest_path(name)
+            student = _student_path(name)
+            lora_path = _lora_path_for_speaker(name)
+
+            is_active = False
+            if active_exists and student.exists():
+                # Cheap match: same size + same content head. Good enough — these
+                # files are large enough that accidental collision is negligible.
+                try:
+                    is_active = (active_student.stat().st_size == student.stat().st_size)
+                except Exception:
+                    is_active = False
+
+            out.append({
+                "name": name,
+                "has_lora": lora_path is not None,
+                "has_csv": (sp / "dataset" / "transcripts_verbatim.csv").exists(),
+                "has_teacher": teacher.exists(),
+                "teacher_path": str(teacher) if teacher.exists() else None,
+                "has_manifest": manifest.exists(),
+                "manifest_entries": _count_manifest_entries(manifest) if manifest.exists() else 0,
+                "pair_count": _count_pair_files(name),
+                "has_student": student.exists(),
+                "student_path": str(student) if student.exists() else None,
+                "is_active_student": is_active,
+            })
+    return {
+        "speakers": out,
+        "active_student_path": str(active_student) if active_exists else None,
+        "active_student_size_mb": round(active_size / 1024 / 1024, 1) if active_exists else 0,
+    }
+
+
+def _count_manifest_entries(path: Path) -> int:
+    try:
+        with open(path) as fp:
+            return sum(1 for line in fp if line.strip())
+    except Exception:
+        return 0
+
+
+@app.get("/distill/list-audio")
+async def distill_list_audio(speaker: str):
+    """List audio files under training/<speaker>/dataset/audio/ so the UI can
+    offer a clickable dropdown of available reference clips."""
+    audio_dir = PROJECT_ROOT / "training" / speaker / "dataset" / "audio"
+    if not audio_dir.exists():
+        return {"speaker": speaker, "audio_dir": str(audio_dir), "files": []}
+    files = sorted(
+        p.name for p in audio_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"}
+    )
+    return {"speaker": speaker, "audio_dir": str(audio_dir), "files": files}
+
+
+@app.post("/distill/snapshot-teacher")
+async def distill_snapshot_teacher(req: DistillSnapshotRequest, background_tasks: BackgroundTasks):
+    speaker_dir = PROJECT_ROOT / "training" / req.speaker
+    if not speaker_dir.exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+
+    dest = _teacher_path(req.speaker)
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "snapshot_cfm_teacher.py"),
+        "--source", str(PROJECT_ROOT / "checkpoints" / "s2mel.pth"),
+        "--dest", str(dest),
+    ]
+    if req.force:
+        cmd.append("--force")
+    if req.merge_lora:
+        lora_path = _lora_path_for_speaker(req.speaker)
+        if lora_path is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"merge_lora=True but no S2Mel LoRA found for {req.speaker}. "
+                       f"Either train an S2Mel LoRA first or pass merge_lora=False.",
+            )
+        cmd.extend(["--merge-lora", str(lora_path)])
+
+    task_id = _new_distill_task("snapshot", req.speaker)
+    background_tasks.add_task(_run_distill_subprocess, task_id, cmd)
+    return {"task_id": task_id, "status": "queued", "command": cmd}
+
+
+@app.post("/distill/build-manifest")
+async def distill_build_manifest(req: DistillManifestRequest):
+    """Build the JSONL manifest. Synchronous — this is fast (CPU-bound, no model)."""
+    speaker_dir = PROJECT_ROOT / "training" / req.speaker
+    if not speaker_dir.exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "build_reflow_manifest.py"),
+        "--speaker", req.speaker,
+        "--output", str(_manifest_path(req.speaker)),
+        "--n-samples", str(req.n_samples),
+        "--min-duration", str(req.min_duration),
+        "--max-duration", str(req.max_duration),
+    ]
+    if req.reference_audio and req.reference_from_row:
+        raise HTTPException(status_code=400, detail="reference_audio and reference_from_row are mutually exclusive")
+    if req.reference_audio:
+        ref = Path(req.reference_audio)
+        if not ref.is_absolute():
+            ref = speaker_dir / "dataset" / "audio" / req.reference_audio
+        if not ref.exists():
+            raise HTTPException(status_code=404, detail=f"reference audio not found: {ref}")
+        cmd.extend(["--reference-audio", str(ref)])
+    if req.reference_from_row:
+        cmd.append("--reference-from-row")
+    if req.limit:
+        cmd.extend(["--limit", str(req.limit)])
+
+    import subprocess
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"build-manifest failed:\n{result.stdout}\n{result.stderr}")
+    return {
+        "status": "ok",
+        "manifest": str(_manifest_path(req.speaker)),
+        "entries": _count_manifest_entries(_manifest_path(req.speaker)),
+        "stdout": result.stdout,
+    }
+
+
+def _ollama_generate_batch(
+    url: str,
+    model: str,
+    style_prompt: str,
+    n: int,
+    min_words: int,
+    max_words: int,
+    extra: Optional[str],
+    timeout: float = 120.0,
+) -> List[str]:
+    """Call Ollama's /api/generate with format=json and parse a JSON array of strings.
+
+    We request structured output (Ollama's `format: "json"` forces valid JSON) and
+    explicitly ask the model for `{"utterances": [...]}` because that shape is more
+    reliable than a top-level array across model families. We then extract the array.
+    Any parsing weirdness raises so the caller can fall back / log it.
+    """
+    import urllib.request
+    import urllib.error
+
+    schema_hint = (
+        'Return ONLY a JSON object of the form '
+        '{"utterances": ["…", "…"]}.\n'
+        'No prose, no markdown, no code fences. The array MUST contain exactly '
+        f'{n} strings.'
+    )
+    user_prompt = (
+        f"Speaker style: {style_prompt}\n\n"
+        f"Write {n} different short utterances (each {min_words}-{max_words} words) "
+        f"that sound like something this speaker would naturally say. "
+        f"Vary the topic and emotional register across the {n} entries — do not "
+        f"repeat themes. Do NOT include speaker labels, quote marks, or stage "
+        f"directions. Just the spoken text.\n"
+    )
+    if extra:
+        user_prompt += f"\nAdditional constraints: {extra}\n"
+    user_prompt += "\n" + schema_hint
+
+    body = json.dumps({
+        "model": model,
+        "prompt": user_prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.9, "top_p": 0.95},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Ollama HTTP error: {e}") from e
+
+    outer = json.loads(raw)
+    response_text = outer.get("response", "").strip()
+    if not response_text:
+        raise RuntimeError(f"Ollama returned empty response. Full reply: {outer}")
+
+    # Strip code fences if the model added them despite format=json
+    if response_text.startswith("```"):
+        response_text = response_text.strip("`")
+        if response_text.lower().startswith("json"):
+            response_text = response_text[4:]
+        response_text = response_text.strip()
+
+    parsed = json.loads(response_text)
+    # Accept either a top-level array or {"utterances": [...]}
+    if isinstance(parsed, dict):
+        for key in ("utterances", "items", "results", "data"):
+            if key in parsed and isinstance(parsed[key], list):
+                parsed = parsed[key]
+                break
+        else:
+            # Last-ditch: take the first list value
+            for v in parsed.values():
+                if isinstance(v, list):
+                    parsed = v
+                    break
+    if not isinstance(parsed, list):
+        raise RuntimeError(f"Ollama response wasn't a list of strings: {response_text[:200]}")
+
+    out = []
+    for item in parsed:
+        if isinstance(item, str):
+            s = item.strip().strip('"').strip()
+            if s:
+                out.append(s)
+        elif isinstance(item, dict):
+            # Some models wrap each string in {"text": "..."} — accept that.
+            for k in ("text", "utterance", "content"):
+                if k in item and isinstance(item[k], str):
+                    out.append(item[k].strip())
+                    break
+    return out
+
+
+def _run_synthetic_manifest(
+    task_id: str,
+    speaker: str,
+    reference_audio: str,
+    style_prompt: str,
+    num_records: int,
+    n_samples: int,
+    ollama_url: str,
+    ollama_model: str,
+    batch_size: int,
+    min_words: int,
+    max_words: int,
+    extra_instructions: Optional[str],
+):
+    """Generate `num_records` synthetic text records via Ollama and append to the manifest.
+
+    Resilient: any failed Ollama batch is logged and skipped; we keep trying until
+    we either hit the target count or run out of attempts (max 3× the target).
+    """
+    task = distillation_tasks[task_id]
+    task["status"] = "running"
+    task["message"] = "Calling Ollama…"
+    task["progress"] = 0.01
+
+    manifest_path = _manifest_path(speaker)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Stable unique-ID prefix so re-running doesn't collide with previous calls.
+    id_prefix = f"syn_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    log = task["log"]
+
+    written = 0
+    attempts = 0
+    max_attempts = max(3, (num_records // max(1, batch_size)) * 3)
+
+    with open(manifest_path, "a", encoding="utf-8") as fp:
+        while written < num_records and attempts < max_attempts:
+            attempts += 1
+            n_this = min(batch_size, num_records - written)
+            try:
+                lines = _ollama_generate_batch(
+                    ollama_url, ollama_model, style_prompt,
+                    n_this, min_words, max_words, extra_instructions,
+                )
+            except Exception as e:
+                msg = f"[attempt {attempts}] Ollama batch failed: {e}"
+                log.append(msg)
+                print(f"[{task_id}] {msg}", flush=True)
+                continue
+
+            n_added = 0
+            for utterance in lines:
+                if not utterance:
+                    continue
+                rec = {
+                    "id": f"{id_prefix}_{written + n_added:05d}",
+                    "audio_prompt": reference_audio,
+                    "text": utterance,
+                    "n_samples": n_samples,
+                }
+                fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n_added += 1
+                if written + n_added >= num_records:
+                    break
+            fp.flush()
+            written += n_added
+
+            task["progress"] = min(0.99, written / max(1, num_records))
+            task["message"] = f"Generated {written}/{num_records} ({attempts} batches)"
+            log_line = f"[attempt {attempts}] +{n_added} → total {written}/{num_records}"
+            log.append(log_line)
+            print(f"[{task_id}] {log_line}", flush=True)
+            if len(log) > 500:
+                del log[: len(log) - 500]
+
+    if written >= num_records:
+        task["status"] = "completed"
+        task["progress"] = 1.0
+        task["message"] = f"Appended {written} synthetic records to manifest"
+    else:
+        task["status"] = "failed"
+        task["message"] = f"Stopped after {attempts} attempts — wrote {written}/{num_records}"
+    task["completed_at"] = datetime.now().isoformat()
+
+
+@app.post("/distill/append-synthetic-manifest")
+async def distill_append_synthetic_manifest(
+    req: DistillSyntheticManifestRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Use Ollama to generate synthetic text records and append them to the speaker's
+    reflow manifest, all pointing at one fixed reference audio. The speaker's voice
+    is already baked into the teacher (LoRA merged), so what we need from the manifest
+    is *text diversity* — exactly what Ollama provides."""
+    speaker_dir = PROJECT_ROOT / "training" / req.speaker
+    if not speaker_dir.exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+
+    # Resolve reference audio to an absolute path now so the manifest is portable.
+    ref = Path(req.reference_audio)
+    if not ref.is_absolute():
+        ref = speaker_dir / "dataset" / "audio" / req.reference_audio
+    if not ref.exists():
+        raise HTTPException(status_code=404, detail=f"reference audio not found: {ref}")
+
+    task_id = _new_distill_task("synthetic_manifest", req.speaker)
+    background_tasks.add_task(
+        _run_synthetic_manifest,
+        task_id,
+        req.speaker,
+        str(ref.resolve()),
+        req.style_prompt,
+        req.num_records,
+        req.n_samples,
+        req.ollama_url,
+        req.ollama_model,
+        req.batch_size,
+        req.min_words,
+        req.max_words,
+        req.extra_instructions,
+    )
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.get("/distill/ollama-models")
+async def distill_list_ollama_models(url: str = "http://localhost:11434"):
+    """Probe an Ollama instance for installed models. Used by the UI to populate
+    the model dropdown without forcing the user to type model names by hand."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        models = [m.get("name") for m in data.get("models", []) if m.get("name")]
+        return {"ok": True, "url": url, "models": models}
+    except Exception as e:
+        return {"ok": False, "url": url, "error": str(e), "models": []}
+
+
+@app.post("/distill/generate-pairs")
+async def distill_generate_pairs(req: DistillPairsRequest, background_tasks: BackgroundTasks):
+    speaker_dir = PROJECT_ROOT / "training" / req.speaker
+    if not speaker_dir.exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+
+    teacher = _teacher_path(req.speaker)
+    if not teacher.exists():
+        # Fall back to the plain default; UI is encouraged to make the per-voice one explicit.
+        teacher = PROJECT_ROOT / "checkpoints" / "s2mel_teacher.pth"
+    if not teacher.exists():
+        raise HTTPException(status_code=400, detail="no teacher snapshot — run snapshot first.")
+
+    manifest = _manifest_path(req.speaker)
+    if not manifest.exists():
+        raise HTTPException(status_code=400, detail="no manifest — run build-manifest first.")
+
+    out_dir = _pairs_dir(req.speaker)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "generate_reflow_pairs.py"),
+        "--manifest", str(manifest),
+        "--teacher", str(teacher),
+        "--output-dir", str(out_dir),
+        "--n-samples", str(req.n_samples),
+        "--teacher-steps", str(req.teacher_steps),
+        "--teacher-cfg", str(req.teacher_cfg),
+    ]
+    if req.limit:
+        cmd.extend(["--limit", str(req.limit)])
+
+    def _parser(line: str, task: Dict[str, Any]):
+        # Lines look like: "[3/120] utt_001: pairs=10 skipped=0 errors=0 rate=2.1/s eta=..."
+        import re
+        m = re.match(r"^\[(\d+)/(\d+)\]", line)
+        if m:
+            done = int(m.group(1))
+            total = int(m.group(2))
+            task["progress"] = min(0.99, done / max(1, total))
+            task["message"] = f"Records {done}/{total}"
+
+    task_id = _new_distill_task("pairs", req.speaker)
+    background_tasks.add_task(_run_distill_subprocess, task_id, cmd, 800, _parser)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/distill/train")
+async def distill_train(req: DistillTrainRequest, background_tasks: BackgroundTasks):
+    speaker_dir = PROJECT_ROOT / "training" / req.speaker
+    if not speaker_dir.exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+
+    pairs_dir = _pairs_dir(req.speaker)
+    if not pairs_dir.exists() or _count_pair_files(req.speaker) == 0:
+        raise HTTPException(status_code=400, detail="no paired data — run generate-pairs first.")
+
+    out_dir = speaker_dir / "cfm_reflow_student"
+
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "train_cfm_reflow.py"),
+        "--pairs-dir", str(pairs_dir),
+        "--output-dir", str(out_dir),
+        "--epochs", str(req.epochs),
+        "--batch-size", str(req.batch_size),
+        "--grad-accumulation", str(req.grad_accumulation),
+        "--learning-rate", str(req.learning_rate),
+        "--val-split", str(req.val_split),
+        "--save-every-epochs", str(req.save_every_epochs),
+    ]
+    if req.resume and (out_dir / "best.pth").exists():
+        cmd.extend(["--resume", str(out_dir / "best.pth")])
+
+    def _parser(line: str, task: Dict[str, Any]):
+        import re
+        m = re.match(r"^== epoch (\d+)/(\d+)\s+train=([\d.]+)\s+val=([\d.]+)", line)
+        if m:
+            ep = int(m.group(1))
+            total = int(m.group(2))
+            task["progress"] = min(0.99, ep / max(1, total))
+            task["message"] = f"Epoch {ep}/{total}  train={m.group(3)} val={m.group(4)}"
+
+    task_id = _new_distill_task("train", req.speaker)
+    background_tasks.add_task(_run_distill_subprocess, task_id, cmd, 800, _parser)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/distill/ab-eval")
+async def distill_ab_eval(req: DistillAbRequest, background_tasks: BackgroundTasks):
+    student = _student_path(req.speaker)
+    if not student.exists():
+        raise HTTPException(status_code=400, detail=f"no student checkpoint for {req.speaker}")
+
+    speaker_dir = PROJECT_ROOT / "training" / req.speaker
+    if req.reference_audio:
+        ref = Path(req.reference_audio)
+        if not ref.is_absolute():
+            ref = speaker_dir / "dataset" / "audio" / req.reference_audio
+    else:
+        # Use the first audio file in the dataset as a reasonable default.
+        audio_dir = speaker_dir / "dataset" / "audio"
+        wavs = sorted(audio_dir.glob("*.wav")) if audio_dir.exists() else []
+        if not wavs:
+            raise HTTPException(status_code=400, detail="no reference audio found and none provided")
+        ref = wavs[0]
+    if not ref.exists():
+        raise HTTPException(status_code=404, detail=f"reference audio not found: {ref}")
+
+    out_dir = speaker_dir / "ab_results" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "ab_eval_cfm.py"),
+        "--audio-prompt", str(ref),
+        "--text", req.text,
+        "--student-checkpoint", str(student),
+        "--output-dir", str(out_dir),
+        "--student-steps", str(req.student_steps),
+        "--student-solver", req.student_solver,
+        "--teacher-steps", str(req.teacher_steps),
+        "--teacher-solver", req.teacher_solver,
+    ]
+
+    task_id = _new_distill_task("ab_eval", req.speaker)
+
+    def _ab_runner():
+        _run_distill_subprocess(task_id, cmd)
+        # On success, expose the wav paths so the UI can fetch them.
+        if distillation_tasks[task_id]["status"] == "completed":
+            distillation_tasks[task_id]["result"] = {
+                "teacher_wav": f"/distill/ab-audio/{req.speaker}/{out_dir.name}/teacher.wav",
+                "student_wav": f"/distill/ab-audio/{req.speaker}/{out_dir.name}/student.wav",
+            }
+
+    background_tasks.add_task(_ab_runner)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.get("/distill/ab-audio/{speaker}/{run_id}/{filename}")
+async def distill_ab_audio(speaker: str, run_id: str, filename: str):
+    if filename not in ("teacher.wav", "student.wav"):
+        raise HTTPException(status_code=400, detail="filename must be teacher.wav or student.wav")
+    path = PROJECT_ROOT / "training" / speaker / "ab_results" / run_id / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=str(path))
+    return FileResponse(str(path), media_type="audio/wav")
+
+
+@app.post("/distill/activate")
+async def distill_activate(req: DistillActivateRequest):
+    student = _student_path(req.speaker)
+    if not student.exists():
+        raise HTTPException(status_code=400, detail=f"no student checkpoint for {req.speaker}")
+
+    active = _active_student_path()
+    # Use copy (not symlink) — IndexTTS2 reads via torch.load on a path; a symlink
+    # would work too, but a real file is more obvious in the checkpoints dir.
+    shutil.copy2(student, active)
+    return {
+        "status": "ok",
+        "active_path": str(active),
+        "note": "Reload the base model (/models/load/base) for the new student to take effect.",
+    }
+
+
+@app.get("/distill/active-status")
+async def distill_active_status():
+    """Lightweight status for the Inference tab. Tells the UI:
+      - whether a distilled student is on disk (would-be-active after model reload)
+      - whether the currently-loaded model is using it (i.e. was loaded after activation)
+      - which speaker's checkpoint it matches, if any
+    The Inference tab uses this to surface a banner and to suggest the right solver/steps.
+    """
+    active_path = _active_student_path()
+    on_disk = active_path.exists()
+    on_disk_size_mb = round(active_path.stat().st_size / 1024 / 1024, 1) if on_disk else 0
+
+    # Which speaker, if any, owns this active checkpoint? Compare file size as a cheap
+    # heuristic — student.pth files are large enough that size collisions are negligible.
+    speaker_match = None
+    if on_disk:
+        training_dir = PROJECT_ROOT / "training"
+        if training_dir.exists():
+            target_size = active_path.stat().st_size
+            for sp in training_dir.iterdir():
+                if not sp.is_dir():
+                    continue
+                cand = sp / "cfm_reflow_student" / "best.pth"
+                try:
+                    if cand.exists() and cand.stat().st_size == target_size:
+                        speaker_match = sp.name
+                        break
+                except Exception:
+                    continue
+
+    # Is the LOADED model actually using the distilled checkpoint? IndexTTS2 stores the
+    # path it was constructed with on self.s2mel_distilled_checkpoint.
+    model_loaded = tts_model is not None
+    loaded_distilled_path = None
+    if model_loaded:
+        loaded_distilled_path = getattr(tts_model, "s2mel_distilled_checkpoint", None)
+    in_use = model_loaded and bool(loaded_distilled_path)
+    needs_reload = on_disk and (
+        not in_use or
+        (loaded_distilled_path and Path(loaded_distilled_path).resolve() != active_path.resolve())
+    )
+
+    return {
+        "active_on_disk": on_disk,
+        "active_path": str(active_path) if on_disk else None,
+        "active_size_mb": on_disk_size_mb,
+        "speaker_match": speaker_match,
+        "model_loaded": model_loaded,
+        "in_use": in_use,
+        "loaded_distilled_path": loaded_distilled_path,
+        "needs_reload": needs_reload,
+        # Suggested solver / steps when distilled is in use — the Inference tab
+        # surfaces these as a one-click "set defaults" button.
+        "suggested": {
+            "solver": "single_step" if in_use else "heun",
+            "diffusion_steps": 1 if in_use else None,  # null = leave preset alone
+            "inference_cfg": 0.0 if in_use else None,
+        },
+    }
+
+
+@app.post("/distill/deactivate")
+async def distill_deactivate():
+    active = _active_student_path()
+    if active.exists():
+        active.unlink()
+        return {"status": "ok", "removed": str(active)}
+    return {"status": "ok", "removed": None, "note": "no active student to remove"}
+
+
+@app.get("/distill/tasks/{task_id}")
+async def distill_get_task(task_id: str, log_lines: int = 50):
+    if task_id not in distillation_tasks:
+        raise HTTPException(status_code=404, detail="task not found")
+    task = distillation_tasks[task_id]
+    log = task.get("log") or []
+    return {
+        "task_id": task_id,
+        "type": task["type"],
+        "speaker_name": task["speaker_name"],
+        "status": task["status"],
+        "progress": task["progress"],
+        "message": task["message"],
+        "started_at": task["started_at"],
+        "completed_at": task.get("completed_at"),
+        "result": task.get("result"),
+        "log_tail": log[-log_lines:] if log_lines > 0 else [],
+        "log_total_lines": len(log),
+    }
+
+
+@app.get("/distill/tasks")
+async def distill_list_tasks():
+    return [
+        {
+            "task_id": tid,
+            "type": t["type"],
+            "speaker_name": t["speaker_name"],
+            "status": t["status"],
+            "progress": t["progress"],
+            "message": t["message"],
+            "started_at": t["started_at"],
+            "completed_at": t.get("completed_at"),
+        }
+        for tid, t in distillation_tasks.items()
+    ]
+
+
+@app.post("/distill/tasks/{task_id}/cancel")
+async def distill_cancel_task(task_id: str):
+    if task_id not in distillation_tasks:
+        raise HTTPException(status_code=404, detail="task not found")
+    task = distillation_tasks[task_id]
+    pid = task.get("pid")
+    if not pid or task["status"] not in ("running", "queued"):
+        raise HTTPException(status_code=400, detail=f"task not running (status={task['status']})")
+    try:
+        os.kill(int(pid), 15)  # SIGTERM
+        task["status"] = "cancelled"
+        task["message"] = "Cancelled by user"
+        task["completed_at"] = datetime.now().isoformat()
+    except ProcessLookupError:
+        task["status"] = "cancelled"
+        task["message"] = "Process already gone"
+    return {"status": "ok"}
+
+
+# ============= GPU memory management =============
+
+
+@app.get("/system/gpu-stats")
+async def gpu_stats():
+    """Return PyTorch + driver-level GPU memory usage. Driver-level numbers come from
+    nvidia-smi-style counters (allocated vs reserved); the gap is the caching
+    allocator's free-block pool — that's what /system/gpu-cleanup releases."""
+    if not torch.cuda.is_available():
+        return {"available": False}
+    dev = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(dev)
+    allocated = torch.cuda.memory_allocated(dev)
+    reserved = torch.cuda.memory_reserved(dev)
+    free, total = torch.cuda.mem_get_info(dev)
+    return {
+        "available": True,
+        "device": dev,
+        "device_name": props.name,
+        "total_mb": round(total / 1024 / 1024, 1),
+        "free_mb": round(free / 1024 / 1024, 1),
+        "used_by_other_mb": round((total - free - reserved) / 1024 / 1024, 1),
+        "torch_allocated_mb": round(allocated / 1024 / 1024, 1),
+        "torch_reserved_mb": round(reserved / 1024 / 1024, 1),
+        "torch_cache_mb": round((reserved - allocated) / 1024 / 1024, 1),
+    }
+
+
+@app.post("/system/gpu-cleanup")
+async def gpu_cleanup():
+    """Force PyTorch to release its CUDA caching-allocator blocks back to the OS.
+    Cheap to call; the next allocation pays a small one-time cost. Useful when the
+    GPU footprint has crept up and you want to see how much was actually live."""
+    if not torch.cuda.is_available():
+        return {"ok": False, "reason": "CUDA not available"}
+    import gc
+    before_reserved = torch.cuda.memory_reserved()
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    after_reserved = torch.cuda.memory_reserved()
+    return {
+        "ok": True,
+        "freed_mb": round((before_reserved - after_reserved) / 1024 / 1024, 1),
+        "reserved_before_mb": round(before_reserved / 1024 / 1024, 1),
+        "reserved_after_mb": round(after_reserved / 1024 / 1024, 1),
+        "allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 1),
+    }
 
 
 if __name__ == "__main__":

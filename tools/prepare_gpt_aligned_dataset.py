@@ -448,12 +448,11 @@ class GPTAlignedExtractor:
         # Project latent through gpt_layer: (B, T, 1280) -> (B, T, 1024)
         latent_proj = self.s2mel.models['gpt_layer'](latent)
         
-        # CRITICAL: Ensure latent matches code length
-        # GPT forward may return hidden states for all positions (text + codes)
-        # We need only the last `code_len` positions which correspond to codes
-        if latent_proj.shape[1] != code_len:
-            # Take the last code_len positions (codes come after text in GPT)
-            latent_proj = latent_proj[:, -code_len:, :]
+        # Ensure we use only the code token positions.
+        # The GPT output includes hidden states for both text and code tokens;
+        # the last `code_len` positions correspond to the generated codes.
+        # Slice unconditionally to avoid accidental inclusion of text token latents.
+        latent_proj = latent_proj[:, -code_len:, :]
         
         # Convert codes to embeddings (same as inference)
         # vq2emb: (B, 1, T_codes) -> (B, 1024, T_codes)

@@ -40,7 +40,7 @@ class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
             use_cuda_kernel=None, use_deepspeed=False, use_accel=False, use_torch_compile=False, lora_path=None,
-            gpt_checkpoint=None
+            gpt_checkpoint=None, s2mel_distilled_checkpoint=None,
     ):
         """
         Args:
@@ -54,6 +54,9 @@ class IndexTTS2:
             use_torch_compile (bool): whether to use torch.compile for optimization or not.
             lora_path (str | None): path to LoRA checkpoint directory for fine-tuned voice adaptation. If None, uses base model.
             gpt_checkpoint (str | None): path to custom GPT checkpoint (e.g., from full fine-tuning). If None, uses default from config.
+            s2mel_distilled_checkpoint (str | None): path to a distilled (reflow / consistency) CFM checkpoint. Loaded on top of
+                the base s2mel weights — overrides only the keys present in the file (typically just the CFM submodule). Use with
+                StreamingConfigV2.solver="single_step" for sub-200ms TTFA. See docs/STREAMING_LATENCY_ROADMAP.md Phase 3.
         """
         if device is not None:
             self.device = device
@@ -165,13 +168,34 @@ class IndexTTS2:
         )
         self.s2mel = s2mel.to(self.device)
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
-        
+
+        # Phase 3: optionally overlay a distilled (reflow / consistency) CFM on top
+        # of the base s2mel weights. The checkpoint format is the same dict-of-state-dicts
+        # that load_checkpoint2 expects; typically it only contains the "cfm" submodule
+        # so the length regulator and gpt_layer keep their base weights. Any keys present
+        # in the file overwrite the corresponding submodule's parameters.
+        self.s2mel_distilled_checkpoint = s2mel_distilled_checkpoint
+        if s2mel_distilled_checkpoint is not None:
+            print(f">> Overlaying distilled CFM checkpoint: {s2mel_distilled_checkpoint}")
+            load_checkpoint2(
+                self.s2mel,
+                None,
+                s2mel_distilled_checkpoint,
+                load_only_params=True,
+                ignore_modules=[],
+                is_distributed=False,
+            )
+            # Re-setup CFM caches after overlay — the estimator's input_pos buffer is
+            # not part of the saved state dict and must be re-initialized after weight load.
+            self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+            print(f">> Distilled CFM loaded — use solver='single_step' for 1-step inference")
+
         # Enable torch.compile optimization if requested
         if self.use_torch_compile:
             print(">> Enabling torch.compile optimization")
             self.s2mel.enable_torch_compile()
             print(">> torch.compile optimization enabled successfully")
-        
+
         self.s2mel.eval()
         print(">> s2mel weights restored from:", s2mel_path)
 
@@ -235,6 +259,14 @@ class IndexTTS2:
         self.cache_emo_cond = None
         self.cache_emo_audio_prompt = None
         self.cache_mel = None
+
+        # Per-speaker cache for the GPT conditioning latent + emo vec. Stored speaker
+        # embeddings on disk don't include `gpt_conditioning`, so every streaming
+        # request re-runs the conditioning encoder (Perceiver + Conformer + emo
+        # projection) over the W2V-BERT features — measurable ~10-15ms of setup
+        # latency. Keyed by a caller-supplied string (typically the embeddings file
+        # path) so the cache survives between requests.
+        self._cond_latent_cache: dict = {}
 
         # 进度引用显示（可选）
         self.gr_progress = None
@@ -422,7 +454,7 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
-              speaker_embeddings=None, **generation_kwargs):
+              speaker_embeddings=None, global_conditioning=None, **generation_kwargs):
         """
         Main inference method for text-to-speech synthesis.
         
@@ -442,6 +474,10 @@ class IndexTTS2:
             stream_return: Return audio as generator
             speaker_embeddings: Pre-computed speaker embeddings dict (for promptless inference)
                 Keys: 'spk_cond_emb', 'style', 'prompt_condition', 'ref_mel', 'emo_cond_emb'
+            global_conditioning: Pre-computed GPT conditioning dict (for consistent training/inference)
+                Keys: 'condition' (32, 1280), 'emo_vec' (1, 1280)
+                When provided, uses this conditioning instead of extracting from reference audio.
+                This ensures inference uses the SAME conditioning that was used during LoRA training.
             **generation_kwargs: Additional generation parameters
             
         Returns:
@@ -459,7 +495,7 @@ class IndexTTS2:
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
                 verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
-                speaker_embeddings=speaker_embeddings, **generation_kwargs
+                speaker_embeddings=speaker_embeddings, global_conditioning=global_conditioning, **generation_kwargs
             )
         else:
             try:
@@ -469,7 +505,7 @@ class IndexTTS2:
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
                     verbose, max_text_tokens_per_segment, stream_return, more_segment_before,
-                    speaker_embeddings=speaker_embeddings, **generation_kwargs
+                    speaker_embeddings=speaker_embeddings, global_conditioning=global_conditioning, **generation_kwargs
                 ))[0]
             except IndexError:
                 return None
@@ -479,7 +515,7 @@ class IndexTTS2:
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
-              speaker_embeddings=None, **generation_kwargs):
+              speaker_embeddings=None, global_conditioning=None, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:

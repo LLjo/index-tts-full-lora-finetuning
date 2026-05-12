@@ -427,22 +427,24 @@ def collate_gpt_aligned_batch(batch: List[Dict]) -> Dict[str, Any]:
     
     For GPT-aligned training, the s2mel_cond is PRE-COMPUTED to match
     inference exactly. We just need to pad it.
+    
+    CRITICAL: cond and mel must have the same temporal dimension!
+    The CFM expects cond.shape[1] == mel.shape[2]
     """
     # Find max lengths
     max_mel_len = max(item["mel"].shape[-1] for item in batch)
-    max_cond_len = max(item["s2mel_cond"].shape[0] for item in batch)
     max_ref_mel_len = max(item["ref_mel"].shape[-1] for item in batch)
     
     batch_size = len(batch)
     
     # Initialize padded tensors
+    # CRITICAL: Use max_mel_len for BOTH mel and cond to ensure they match!
     mels = torch.zeros(batch_size, 80, max_mel_len)
-    s2mel_conds = torch.zeros(batch_size, max_cond_len, batch[0]["s2mel_cond"].shape[-1])
+    s2mel_conds = torch.zeros(batch_size, max_mel_len, batch[0]["s2mel_cond"].shape[-1])
     styles = torch.zeros(batch_size, 192)
     ref_mels = torch.zeros(batch_size, 80, max_ref_mel_len)
     
     mel_lengths = []
-    cond_lengths = []
     ref_mel_lengths = []
     has_stutters = []
     
@@ -451,24 +453,30 @@ def collate_gpt_aligned_batch(batch: List[Dict]) -> Dict[str, Any]:
         cond_len = item["s2mel_cond"].shape[0]
         ref_mel_len = item["ref_mel"].shape[-1]
         
+        # Ensure cond length matches mel length
+        # If cond is shorter, pad it. If longer, truncate it.
+        actual_cond_len = min(cond_len, mel_len)
+        
         mels[i, :, :mel_len] = item["mel"]
-        s2mel_conds[i, :cond_len, :] = item["s2mel_cond"]
+        s2mel_conds[i, :actual_cond_len, :] = item["s2mel_cond"][:actual_cond_len, :]
+        
+        # If cond was shorter than mel, we already padded with zeros
+        # If cond was longer, we truncated to mel_len
+        
         styles[i, :] = item["style"]
         ref_mels[i, :, :ref_mel_len] = item["ref_mel"]
         
         mel_lengths.append(mel_len)
-        cond_lengths.append(cond_len)
         ref_mel_lengths.append(ref_mel_len)
         has_stutters.append(item["has_stutters"])
     
     return {
         "ids": [item["id"] for item in batch],
-        "mel": mels,  # (B, 80, T)
-        "s2mel_cond": s2mel_conds,  # (B, T_cond, 768) - PRE-COMPUTED!
+        "mel": mels,  # (B, 80, T_mel)
+        "s2mel_cond": s2mel_conds,  # (B, T_mel, 768) - MATCHED to mel length!
         "style": styles,  # (B, 192)
         "ref_mel": ref_mels,  # (B, 80, T_ref)
         "mel_lengths": torch.tensor(mel_lengths, dtype=torch.long),
-        "cond_lengths": torch.tensor(cond_lengths, dtype=torch.long),
         "ref_mel_lengths": torch.tensor(ref_mel_lengths, dtype=torch.long),
         "has_stutters": torch.tensor(has_stutters, dtype=torch.bool),
     }
