@@ -16,7 +16,7 @@ from datetime import datetime
 import json
 import queue
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -69,6 +69,33 @@ if STATIC_DIR.exists():
 tts_model: Optional[IndexTTS2] = None
 loaded_models: Dict[str, Dict[str, Any]] = {}
 training_tasks: Dict[str, Dict[str, Any]] = {}
+
+# Process-level cache for parsed speaker_embeddings.pt dicts. Keyed by
+# (resolved_path, mtime_ns) so retraining / regenerating embeddings invalidates
+# automatically. Without this every /inference/stream call that uses stored
+# embeddings re-does torch.load + the report loop in SpeakerEmbeddingStore
+# (≈100-300ms TTFA regression for the HA flow).
+_speaker_embeddings_cache: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _load_speaker_embeddings_cached(store, path: Path):
+    """Cached wrapper around SpeakerEmbeddingStore.load_embeddings.
+
+    Returns the same dict identity on hits so downstream code doesn't trigger
+    a fresh `.to(device)` copy each time either."""
+    try:
+        st = path.stat()
+    except OSError:
+        # Fall through to uncached load — store.load_embeddings will raise
+        # with a clearer message if the file actually doesn't exist.
+        return store.load_embeddings(path)
+    key = (str(path.resolve()), st.st_mtime_ns)
+    hit = _speaker_embeddings_cache.get(key)
+    if hit is not None:
+        return hit
+    emb = store.load_embeddings(path)
+    _speaker_embeddings_cache[key] = emb
+    return emb
 
 
 # ============= Pydantic Models =============
@@ -462,7 +489,8 @@ def _build_streaming_config(request: "StreamTTSRequest") -> StreamingConfigV2:
 @app.post("/inference/stream")
 async def stream_speech(
     audio_file: Optional[UploadFile] = File(None, description="Speaker reference audio (optional when using patterns)"),
-    request_json: str = Form(..., description="JSON request parameters")
+    request_json: str = Form(..., description="JSON request parameters"),
+    raw_pcm: bool = Query(False, description="Emit raw 16-bit PCM (no WAV header) at 22050Hz/mono. Used by the Wyoming bridge so the bridge doesn't have to header-strip."),
 ):
     """
     Stream speech generation with optimized streaming for fast time-to-first-audio.
@@ -525,7 +553,7 @@ async def stream_speech(
 
                     if speaker_emb_path.exists():
                         store = SpeakerEmbeddingStore(tts_model)
-                        speaker_embeddings = store.load_embeddings(speaker_emb_path)
+                        speaker_embeddings = _load_speaker_embeddings_cached(store, speaker_emb_path)
                         cond_cache_key = str(speaker_emb_path)
                     else:
                         yield b"Error: Speaker embeddings not found"
@@ -569,20 +597,21 @@ async def stream_speech(
                 # Convert to int16 bytes
                 chunk_int16 = wav_chunk.type(torch.int16)
                 
-                # Send WAV header with first chunk
-                if not header_sent:
+                # Send WAV header with first chunk (unless raw_pcm — Wyoming bridge
+                # wants raw int16 LE with no header).
+                if not raw_pcm and not header_sent:
                     wav_io = io.BytesIO()
                     with wave.open(wav_io, 'wb') as wav_file:
                         wav_file.setnchannels(1)
                         wav_file.setsampwidth(2)
                         wav_file.setframerate(22050)
                         wav_file.writeframes(b'\x00\x00')
-                    
+
                     wav_io.seek(0)
                     header = wav_io.read(44)
                     yield header
                     header_sent = True
-                
+
                 # Stream raw PCM data
                 yield chunk_int16.cpu().numpy().tobytes()
                 chunk_idx += 1
@@ -595,7 +624,8 @@ async def stream_speech(
                 except:
                     pass
     
-    return StreamingResponse(generate_chunks(), media_type="audio/wav")
+    media_type = "audio/L16; rate=22050; channels=1" if raw_pcm else "audio/wav"
+    return StreamingResponse(generate_chunks(), media_type=media_type)
 
 
 # ============= Phase 2 testing helpers =============
@@ -675,7 +705,7 @@ async def warmup(
                 speaker_emb_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
                 if speaker_emb_path.exists():
                     store = SpeakerEmbeddingStore(tts_model)
-                    speaker_embeddings = store.load_embeddings(speaker_emb_path)
+                    speaker_embeddings = _load_speaker_embeddings_cached(store, speaker_emb_path)
                     cond_cache_key = str(speaker_emb_path)
                 else:
                     raise HTTPException(status_code=404, detail="Speaker embeddings not found")
@@ -793,7 +823,7 @@ async def stream_diagnostics(
                 speaker_emb_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
                 if speaker_emb_path.exists():
                     store = SpeakerEmbeddingStore(tts_model)
-                    speaker_embeddings = store.load_embeddings(speaker_emb_path)
+                    speaker_embeddings = _load_speaker_embeddings_cached(store, speaker_emb_path)
                     cond_cache_key = str(speaker_emb_path)
                 else:
                     raise HTTPException(status_code=404, detail="Speaker embeddings not found")
@@ -929,7 +959,7 @@ async def generate_with_patterns(
             )
         
         store = SpeakerEmbeddingStore(tts_model)
-        speaker_embeddings = store.load_embeddings(speaker_emb_path)
+        speaker_embeddings = _load_speaker_embeddings_cached(store, speaker_emb_path)
     
     # Generate
     result = pattern_aware_inference(
