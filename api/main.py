@@ -243,9 +243,8 @@ async def list_models():
             if pattern_path.exists():
                 has_patterns = True
             
-            # Check for LoRA
-            lora_path = speaker_dir / "pattern_training" / "best_checkpoint" / "lora"
-            if lora_path.exists() and (lora_path / "adapter_config.json").exists():
+            # Check for a GPT LoRA in any of the supported training dirs.
+            if _find_gpt_lora_for_speaker(speaker_dir.name) is not None:
                 has_lora = True
             
             if has_lora or has_patterns:
@@ -313,16 +312,15 @@ async def load_model(speaker_name: str):
     if not speaker_dir.exists():
         raise HTTPException(status_code=404, detail=f"Speaker '{speaker_name}' not found")
     
-    # Find LoRA path
-    lora_path = speaker_dir / "pattern_training" / "best_checkpoint" / "lora"
-    if not lora_path.exists():
-        lora_path = speaker_dir / "pattern_training" / "final_checkpoint" / "lora"
-    
-    if lora_path.exists() and (lora_path / "adapter_config.json").exists():
+    # Find a GPT LoRA — check character_lora (new trainer) first, then verbatim_training,
+    # then the legacy pattern_training paths. First hit wins.
+    lora_path = _find_gpt_lora_for_speaker(speaker_name)
+
+    if lora_path is not None:
         try:
             tts_model.load_lora(str(lora_path))
             loaded_models[speaker_name] = {"lora_path": str(lora_path)}
-            return {"status": "success", "message": f"Loaded LoRA for {speaker_name}"}
+            return {"status": "success", "message": f"Loaded LoRA for {speaker_name}", "lora_path": str(lora_path)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load LoRA: {str(e)}")
     else:
@@ -1145,26 +1143,58 @@ async def run_training_pipeline(
 
 @app.get("/speakers")
 async def list_speakers():
-    """List all available speakers"""
+    """List all speakers with everything the UI needs to show useful state.
+
+    A "trainable" speaker is one with audio + at least one of: a character LoRA,
+    pattern embeddings, or stored speaker embeddings. The Inference tab's
+    dropdown shows all of these; the WebUI no longer filters by has_patterns
+    (which used to hide new character-LoRA speakers that didn't go through the
+    legacy pattern-embedding pipeline).
+    """
     speakers = []
     training_dir = PROJECT_ROOT / "training"
-    
-    if training_dir.exists():
-        for speaker_dir in training_dir.iterdir():
-            if not speaker_dir.is_dir():
-                continue
-            
-            # Check for embeddings
-            embeddings_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
-            pattern_path = speaker_dir / "pattern_training" / "best_checkpoint" / "pattern_embedding.pt"
-            
-            speakers.append({
-                "name": speaker_dir.name,
-                "has_embeddings": embeddings_path.exists(),
-                "has_patterns": pattern_path.exists(),
-                "path": str(speaker_dir)
-            })
-    
+    if not training_dir.exists():
+        return speakers
+
+    audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+    for speaker_dir in sorted(p for p in training_dir.iterdir() if p.is_dir()):
+        name = speaker_dir.name
+
+        embeddings_path = speaker_dir / "embeddings" / "speaker_embeddings.pt"
+        pattern_path = speaker_dir / "pattern_training" / "best_checkpoint" / "pattern_embedding.pt"
+        audio_dir = speaker_dir / "dataset" / "audio"
+        n_audio = 0
+        if audio_dir.exists():
+            n_audio = sum(1 for p in audio_dir.iterdir()
+                          if p.is_file() and p.suffix.lower() in audio_exts)
+
+        lora_info = _classify_gpt_lora(name)
+        lora_kind = lora_info["kind"] if lora_info else None
+        lora_path_value = str(lora_info["path"]) if lora_info else None
+        student = _student_path(name)
+
+        speakers.append({
+            "name": name,
+            "has_embeddings": embeddings_path.exists(),
+            "has_patterns": pattern_path.exists(),
+            # Strict: only the new clean-text trainer's output counts as a
+            # "real" character LoRA. Legacy verbatim/pattern adapters load fine
+            # at inference but don't behave the same on clean text — they're
+            # surfaced via lora_kind so the UI can warn.
+            "has_character_lora": lora_kind == "character",
+            "gpt_lora_kind": lora_kind,
+            "gpt_lora_path": lora_path_value,
+            "character_lora_path": lora_path_value if lora_kind == "character" else None,
+            "n_audio_files": n_audio,
+            "has_distilled_student": student.exists(),
+            "is_active_student": _is_active_student_for_speaker(name),
+            # A speaker is "loadable" — i.e. worth showing in the Inference dropdown
+            # — if it has any inference-time artifact (any LoRA kind, patterns,
+            # or stored embeddings).
+            "is_loadable": bool(lora_info) or pattern_path.exists() or embeddings_path.exists(),
+            "path": str(speaker_dir),
+        })
+
     return speakers
 
 
@@ -1199,6 +1229,116 @@ def _active_student_path() -> Path:
     return PROJECT_ROOT / "checkpoints" / "s2mel_distilled.pth"
 
 
+def _active_student_meta_path() -> Path:
+    """Sidecar JSON next to s2mel_distilled.pth recording which speaker activated
+    it. Written by /distill/activate; read by status endpoints so we don't have
+    to guess from byte-size equality (which is unreliable — all speakers' student
+    checkpoints share the same architecture and therefore the same byte size)."""
+    return PROJECT_ROOT / "checkpoints" / "s2mel_distilled.meta.json"
+
+
+# Cache for file-head hashes keyed by (resolved_path, mtime_ns, size). Cleared
+# implicitly whenever a file changes (mtime / size change → different key).
+_FILE_HEAD_HASH_CACHE: Dict[tuple, str] = {}
+
+
+def _file_head_sha256(path: Path, n_bytes: int = 1 << 20) -> Optional[str]:
+    """Return a hex digest of the first n_bytes of a file, or None if unreadable.
+    1 MB is plenty to distinguish per-speaker LoRA-overlaid student checkpoints
+    — verified empirically that distinct speakers' best.pth diverge well within
+    the first MB despite sharing architecture and total byte size."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path.resolve()), st.st_mtime_ns, st.st_size)
+    cached = _FILE_HEAD_HASH_CACHE.get(key)
+    if cached:
+        return cached
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            h.update(f.read(n_bytes))
+        digest = h.hexdigest()
+    except OSError:
+        return None
+    _FILE_HEAD_HASH_CACHE[key] = digest
+    return digest
+
+
+def _resolve_active_student_speaker() -> Optional[str]:
+    """Return the speaker whose best.pth is the currently-active distilled
+    checkpoint. Prefers the sidecar manifest; falls back to head-hash
+    comparison so already-activated checkpoints from before the sidecar
+    feature still resolve correctly."""
+    active = _active_student_path()
+    if not active.exists():
+        return None
+
+    # 1) Sidecar wins if its claimed speaker still points at a matching student.
+    meta_path = _active_student_meta_path()
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            sp = meta.get("speaker")
+            if sp:
+                cand = _student_path(sp)
+                if cand.exists():
+                    expected = meta.get("sha256_head")
+                    if expected:
+                        # Validate the active checkpoint still matches what the
+                        # sidecar describes (user could have manually replaced
+                        # the file without re-running activate).
+                        if _file_head_sha256(active) == expected:
+                            return sp
+                    else:
+                        return sp
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # 2) Hash-based fallback: hash the active file and every speaker's best.pth
+    #    head; first equal hash wins. Speakers iterated alphabetically, but
+    #    since hashes uniquely identify the content this is deterministic.
+    active_hash = _file_head_sha256(active)
+    if active_hash is None:
+        return None
+    training_dir = PROJECT_ROOT / "training"
+    if not training_dir.exists():
+        return None
+    for sp_dir in sorted(p for p in training_dir.iterdir() if p.is_dir()):
+        cand = sp_dir / "cfm_reflow_student" / "best.pth"
+        if cand.exists() and _file_head_sha256(cand) == active_hash:
+            return sp_dir.name
+    return None
+
+
+def _is_active_student_for_speaker(speaker: str) -> bool:
+    """Per-speaker version of the active-student check used by /distill/speakers
+    and /character/status. Uses the same hash-based identity as the resolver."""
+    active = _active_student_path()
+    if not active.exists():
+        return False
+    cand = _student_path(speaker)
+    if not cand.exists():
+        return False
+    # Sidecar shortcut
+    meta_path = _active_student_meta_path()
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("speaker") == speaker:
+                return True
+            # If the sidecar claims a DIFFERENT speaker and the hash agrees,
+            # trust the sidecar.
+            if meta.get("speaker") and meta.get("sha256_head"):
+                if _file_head_sha256(active) == meta["sha256_head"]:
+                    return False
+        except (OSError, json.JSONDecodeError):
+            pass
+    return _file_head_sha256(active) == _file_head_sha256(cand)
+
+
 def _count_pair_files(speaker: str) -> int:
     d = _pairs_dir(speaker)
     if not d.exists():
@@ -1220,6 +1360,59 @@ def _lora_path_for_speaker(speaker: str) -> Optional[Path]:
     return None
 
 
+def _find_gpt_lora_for_speaker(speaker: str) -> Optional[Path]:
+    """Locate any GPT-side LoRA for back-compat loading. Use _classify_gpt_lora
+    when you need to know whether it's the real (new) character LoRA versus a
+    legacy one trained on verbatim text or with the older pattern-combo trainer."""
+    info = _classify_gpt_lora(speaker)
+    return info["path"] if info else None
+
+
+def _classify_gpt_lora(speaker: str) -> Optional[Dict[str, Any]]:
+    """Classify which kind of GPT LoRA (if any) we have for this speaker.
+
+    Returns {path, kind} where kind is one of:
+      * "character"      — trained by tools/train_character_lora.py on CLEAN
+                           text with the masked stutter-weighted loss. This is
+                           what the new voice-to-voice pipeline expects.
+      * "verbatim"       — trained by the older tools/train_verbatim_lora.py on
+                           VERBATIM text. Loads fine but expects verbatim input
+                           at inference; will under-stutter on clean text.
+      * "legacy_pattern" — output of the old pattern+LoRA combo trainer
+                           (pattern_training/). Similar caveats to verbatim.
+
+    Order: prefer the strongest "character" hit; otherwise fall through.
+    """
+    base = PROJECT_ROOT / "training" / speaker
+    candidates = [
+        ("character",      base / "character_lora" / "best_checkpoint" / "lora"),
+        ("character",      base / "character_lora" / "final_checkpoint" / "lora"),
+        ("verbatim",       base / "verbatim_training" / "best_checkpoint" / "lora"),
+        ("verbatim",       base / "verbatim_training" / "final_checkpoint" / "lora"),
+        ("legacy_pattern", base / "pattern_training" / "best_checkpoint" / "lora"),
+        ("legacy_pattern", base / "pattern_training" / "final_checkpoint" / "lora"),
+    ]
+    for kind, cand in candidates:
+        if cand.exists() and (cand / "adapter_config.json").exists():
+            return {"path": cand, "kind": kind}
+    return None
+
+
+def _character_dirs(speaker: str) -> Dict[str, Path]:
+    base = PROJECT_ROOT / "training" / speaker
+    return {
+        "base": base,
+        "audio": base / "dataset" / "audio",
+        "transcripts": base / "dataset" / "transcripts_dual.csv",
+        "transcripts_verbatim": base / "dataset" / "transcripts_verbatim.csv",
+        "transcripts_clean": base / "dataset" / "transcripts.csv",
+        "dataset_manifest": base / "character_dataset" / "manifest.jsonl",
+        "lora_best": base / "character_lora" / "best_checkpoint" / "lora",
+        "lora_final": base / "character_lora" / "final_checkpoint" / "lora",
+        "logit_diff": base / "character_lora" / "logit_diff.json",
+    }
+
+
 def _new_distill_task(task_type: str, speaker: str) -> str:
     task_id = f"distill_{task_type}_{speaker}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
     distillation_tasks[task_id] = {
@@ -1234,6 +1427,22 @@ def _new_distill_task(task_type: str, speaker: str) -> str:
         "pid": None,
     }
     return task_id
+
+
+def _run_distill_then(task_id: str, cmd: List[str], on_complete) -> None:
+    """Run _run_distill_subprocess and then fire a post-completion callback.
+
+    The callback runs even if the subprocess failed; it can read the task dict
+    via `distillation_tasks[task_id]` and update status/log as needed (for
+    example to downgrade a 0-exit run to "failed" after a quality check).
+    """
+    try:
+        _run_distill_subprocess(task_id, cmd)
+    finally:
+        try:
+            on_complete()
+        except Exception as e:
+            print(f"[{task_id}] on_complete crashed: {e}")
 
 
 def _run_distill_subprocess(
@@ -1363,6 +1572,293 @@ class DistillActivateRequest(BaseModel):
     speaker: str
 
 
+# ============= Character LoRA pipeline (new) =============
+
+class CharacterCreateSpeakerRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64,
+                      description="Folder-safe speaker name (letters/digits/underscore).")
+
+
+class CharacterTranscribeRequest(BaseModel):
+    speaker: str
+    skip_parakeet: bool = Field(False, description="Skip the verbatim ASR — only emit clean Whisper.")
+    word_timestamps: bool = Field(True, description="Also run Whisper word-level timestamps and emit a JSONL.")
+    force: bool = Field(False, description="Re-transcribe even if outputs already exist.")
+
+
+class CharacterPrepareRequest(BaseModel):
+    speaker: str
+    reference_audio: Optional[str] = Field(None,
+        description="Optional clip under dataset/audio (or abs path). Enables global conditioning.")
+    min_duration: float = Field(1.0, ge=0.0)
+    max_duration: float = Field(15.0, ge=1.0, le=60.0)
+    pad_tokens: int = Field(8, ge=0, le=64,
+        description="Mel-token padding around each detected stutter span.")
+    limit: Optional[int] = Field(None, description="Cap N samples for smoke test.")
+
+
+class CharacterTrainRequest(BaseModel):
+    speaker: str
+    epochs: int = Field(40, ge=1, le=400)
+    batch_size: int = Field(2, ge=1, le=32)
+    learning_rate: float = Field(2e-4, ge=1e-6, le=1e-2)
+    lora_rank: int = Field(32, ge=4, le=128)
+    lora_alpha: int = Field(64, ge=4, le=256)
+    stutter_weight: float = Field(15.0, ge=1.0, le=100.0,
+        description="Per-mel-token weight on stutter-mask positions.")
+    overfit_test: bool = Field(False,
+        description="Sanity-check mode: 2 samples, 200 epochs. ~3 min on GPU.")
+    logit_diff: bool = Field(True,
+        description="Dump pre/post-LoRA top-k mel-token probabilities after training.")
+
+
+def _safe_speaker_name(name: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in name).strip("_")
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="speaker name must contain alphanumeric characters")
+    return cleaned
+
+
+@app.get("/character/status")
+async def character_status(speaker: str):
+    """One-stop status used by the Speakers WebUI tab."""
+    d = _character_dirs(speaker)
+    if not d["base"].exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {speaker}")
+
+    audio_files = []
+    if d["audio"].exists():
+        audio_files = [p.name for p in d["audio"].iterdir()
+                       if p.is_file() and p.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}]
+    n_audio = len(audio_files)
+
+    has_clean = d["transcripts_clean"].exists() or d["transcripts"].exists()
+    has_verbatim = d["transcripts_verbatim"].exists() or d["transcripts"].exists()
+    n_manifest = _count_manifest_entries(d["dataset_manifest"]) if d["dataset_manifest"].exists() else 0
+
+    lora_path = _find_gpt_lora_for_speaker(speaker)
+    has_lora = lora_path is not None
+
+    logit_diff = None
+    if d["logit_diff"].exists():
+        try:
+            logit_diff = json.loads(d["logit_diff"].read_text())
+        except Exception:
+            logit_diff = None
+
+    # Distillation cross-check (matches distill_list_speakers logic)
+    teacher = _teacher_path(speaker)
+    student = _student_path(speaker)
+    is_active_student = _is_active_student_for_speaker(speaker)
+
+    return {
+        "speaker": speaker,
+        "n_audio_files": n_audio,
+        "audio_files_sample": audio_files[:8],
+        "has_clean_transcripts": has_clean,
+        "has_verbatim_transcripts": has_verbatim,
+        "n_manifest_entries": n_manifest,
+        "has_character_lora": has_lora,
+        "character_lora_path": str(lora_path) if lora_path else None,
+        "logit_diff": logit_diff,
+        "has_teacher_snapshot": teacher.exists(),
+        "has_distilled_student": student.exists(),
+        "is_active_student": is_active_student,
+    }
+
+
+@app.post("/character/create-speaker")
+async def character_create_speaker(req: CharacterCreateSpeakerRequest):
+    name = _safe_speaker_name(req.name)
+    d = _character_dirs(name)
+    if d["base"].exists():
+        raise HTTPException(status_code=400, detail=f"speaker '{name}' already exists")
+    d["audio"].mkdir(parents=True, exist_ok=True)
+    return {"status": "ok", "speaker": name, "audio_dir": str(d["audio"])}
+
+
+@app.post("/character/upload-audio")
+async def character_upload_audio(
+    speaker: str = Form(...),
+    audio_files: List[UploadFile] = File(...),
+):
+    """Persist uploaded audio files into training/<speaker>/dataset/audio/."""
+    d = _character_dirs(speaker)
+    if not d["base"].exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {speaker}")
+    d["audio"].mkdir(parents=True, exist_ok=True)
+
+    saved = []
+    for up in audio_files:
+        # Strip path components for safety, keep just the basename
+        safe = Path(up.filename or "audio.wav").name
+        if not safe:
+            continue
+        # Avoid clobbering: if name exists, suffix with timestamp
+        dest = d["audio"] / safe
+        if dest.exists():
+            stem, suf = dest.stem, dest.suffix
+            dest = d["audio"] / f"{stem}_{int(time.time())}{suf}"
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(up.file, f)
+        saved.append(dest.name)
+    return {"status": "ok", "saved": saved, "total_in_dir": len(list(d["audio"].iterdir()))}
+
+
+@app.post("/character/transcribe")
+async def character_transcribe(req: CharacterTranscribeRequest, background_tasks: BackgroundTasks):
+    """Background-run tools/transcribe_dual.py to produce clean + verbatim transcripts.
+
+    Word-level timestamps are emitted as a sidecar JSONL when requested. The
+    new pipeline expects transcripts at dataset/transcripts.csv (clean) and
+    dataset/transcripts_verbatim.csv (verbatim). transcribe_dual emits a
+    combined CSV with `fastwhisper` and `parakeet` columns, which the prep
+    step reads directly — no normalization needed.
+    """
+    d = _character_dirs(req.speaker)
+    if not d["base"].exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+    if not d["audio"].exists() or not any(d["audio"].iterdir()):
+        raise HTTPException(status_code=400, detail="no audio files — upload some first")
+
+    transcripts_dual = d["base"] / "dataset" / "transcripts_dual.csv"
+    if transcripts_dual.exists() and not req.force:
+        return {"status": "skipped", "reason": "transcripts already exist; pass force=true to re-run",
+                "path": str(transcripts_dual)}
+
+    task_id = _new_distill_task("character_transcribe", req.speaker)
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "transcribe_dual.py"),
+        "--audio-dir", str(d["audio"]),
+        "--output-csv", str(transcripts_dual),
+        # Fail loudly if Parakeet can't load, so we never silently ship an empty
+        # verbatim column again (this is the bug that hit ozzyv6).
+        "--strict-parakeet",
+    ]
+
+    def _verify_columns(line: str, task: Dict[str, Any]):
+        # The subprocess's own [Coverage] report carries the truth — but the
+        # background_tasks runner already streams it into the log. We re-scan
+        # the CSV on completion below; nothing to do here.
+        pass
+
+    def _on_complete():
+        # Re-scan the output CSV. If a column is entirely empty, downgrade the
+        # task to "failed" with a clear, UI-visible message even if the
+        # subprocess returned 0.
+        try:
+            if not transcripts_dual.exists():
+                return
+            import csv as _csv
+            with open(transcripts_dual, encoding="utf-8") as f:
+                rows = list(_csv.DictReader(f))
+            n = len(rows)
+            if n == 0:
+                return
+            empty = {
+                col: sum(1 for r in rows if not (r.get(col) or "").strip())
+                for col in ("fastwhisper", "parakeet")
+            }
+            t = distillation_tasks.get(task_id)
+            if t is None:
+                return
+            problems = [col for col, k in empty.items() if k == n]
+            if problems:
+                t["status"] = "failed"
+                t["message"] = (
+                    f"transcribe completed but column(s) {problems} are entirely empty. "
+                    f"Check the log tail for load errors."
+                )
+                t.setdefault("log", []).append(
+                    f"[POST-CHECK] all {n} rows have empty {problems} — task downgraded to failed."
+                )
+            else:
+                # success summary into the log so the UI can show useful stats
+                t.setdefault("log", []).append(
+                    f"[POST-CHECK] {n} rows  fastwhisper-empty={empty['fastwhisper']}  "
+                    f"parakeet-empty={empty['parakeet']}"
+                )
+        except Exception as e:
+            print(f"[{task_id}] post-check error: {e}")
+
+    background_tasks.add_task(_run_distill_then, task_id, cmd, _on_complete)
+    return {"task_id": task_id, "status": "queued", "output": str(transcripts_dual)}
+
+
+@app.post("/character/prepare-dataset")
+async def character_prepare_dataset(req: CharacterPrepareRequest, background_tasks: BackgroundTasks):
+    d = _character_dirs(req.speaker)
+    if not d["base"].exists():
+        raise HTTPException(status_code=404, detail=f"speaker not found: {req.speaker}")
+
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "prepare_character_dataset.py"),
+        "--speaker", req.speaker,
+        "--min-duration", str(req.min_duration),
+        "--max-duration", str(req.max_duration),
+        "--pad-tokens", str(req.pad_tokens),
+    ]
+    if req.reference_audio:
+        ref = Path(req.reference_audio)
+        if not ref.is_absolute():
+            ref = d["audio"] / req.reference_audio
+        if not ref.exists():
+            raise HTTPException(status_code=404, detail=f"reference audio not found: {ref}")
+        cmd.extend(["--reference-audio", str(ref)])
+    if req.limit is not None:
+        cmd.extend(["--limit", str(req.limit)])
+
+    task_id = _new_distill_task("character_prepare", req.speaker)
+    background_tasks.add_task(_run_distill_subprocess, task_id, cmd)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.post("/character/train")
+async def character_train(req: CharacterTrainRequest, background_tasks: BackgroundTasks):
+    d = _character_dirs(req.speaker)
+    if not d["dataset_manifest"].exists():
+        raise HTTPException(status_code=400, detail="no character dataset manifest — run prepare-dataset first")
+
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "tools" / "train_character_lora.py"),
+        "--speaker", req.speaker,
+        "--epochs", str(req.epochs),
+        "--batch-size", str(req.batch_size),
+        "--learning-rate", str(req.learning_rate),
+        "--lora-rank", str(req.lora_rank),
+        "--lora-alpha", str(req.lora_alpha),
+        "--stutter-weight", str(req.stutter_weight),
+    ]
+    if req.overfit_test:
+        cmd.append("--overfit-test")
+    if req.logit_diff:
+        cmd.append("--logit-diff")
+
+    task_type = "character_overfit" if req.overfit_test else "character_train"
+    task_id = _new_distill_task(task_type, req.speaker)
+
+    def _parse_progress(line: str, task: Dict[str, Any]):
+        # match "epoch  NN/MM  loss=..." style emitted by the trainer
+        import re as _re
+        m = _re.search(r"epoch\s+(\d+)/(\d+)", line)
+        if m:
+            cur, total = int(m.group(1)), int(m.group(2))
+            task["progress"] = min(0.99, cur / max(total, 1))
+            task["message"] = f"Epoch {cur}/{total}"
+
+    background_tasks.add_task(_run_distill_subprocess, task_id, cmd, 1000, _parse_progress)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.get("/character/diagnose")
+async def character_diagnose(speaker: str):
+    """Return the logit_diff.json the trainer emits (if --logit-diff was used)."""
+    d = _character_dirs(speaker)
+    if not d["logit_diff"].exists():
+        raise HTTPException(status_code=404, detail="no logit_diff.json — train with --logit-diff first")
+    return json.loads(d["logit_diff"].read_text())
+
+
 # ---- Endpoints ----
 
 
@@ -1381,20 +1877,34 @@ async def distill_list_speakers():
             teacher = _teacher_path(name)
             manifest = _manifest_path(name)
             student = _student_path(name)
-            lora_path = _lora_path_for_speaker(name)
+            # Two different LoRAs — both matter to the Distill flow but for
+            # different reasons:
+            #   * Character LoRA (GPT-side) — auto-loaded at pair-gen so the
+            #     teacher emits stuttered tokens. The thing the user trains via
+            #     the Speakers tab.
+            #   * S2Mel LoRA (CFM-side) — optional "Merge LoRA" toggle on the
+            #     Snapshot card. Rarely used in this repo.
+            gpt_lora_info = _classify_gpt_lora(name)
+            gpt_lora_kind = gpt_lora_info["kind"] if gpt_lora_info else None
+            gpt_lora_path_value = str(gpt_lora_info["path"]) if gpt_lora_info else None
+            s2mel_lora_path = _lora_path_for_speaker(name)
 
-            is_active = False
-            if active_exists and student.exists():
-                # Cheap match: same size + same content head. Good enough — these
-                # files are large enough that accidental collision is negligible.
-                try:
-                    is_active = (active_student.stat().st_size == student.stat().st_size)
-                except Exception:
-                    is_active = False
+            is_active = _is_active_student_for_speaker(name)
 
             out.append({
                 "name": name,
-                "has_lora": lora_path is not None,
+                # Strict: only the new clean-text trainer's output is a real
+                # character LoRA. Legacy verbatim/pattern dirs still load, but
+                # they expect a different input distribution at inference.
+                "has_character_lora": gpt_lora_kind == "character",
+                "character_lora_path": gpt_lora_path_value if gpt_lora_kind == "character" else None,
+                "gpt_lora_kind": gpt_lora_kind,
+                "gpt_lora_path": gpt_lora_path_value,
+                "has_s2mel_lora": s2mel_lora_path is not None,
+                "s2mel_lora_path": str(s2mel_lora_path) if s2mel_lora_path else None,
+                # Back-compat: `has_lora` used to mean "any LoRA". Keep it
+                # mirroring has_character_lora so old UI code reads correctly.
+                "has_lora": gpt_lora_kind == "character",
                 "has_csv": (sp / "dataset" / "transcripts_verbatim.csv").exists(),
                 "has_teacher": teacher.exists(),
                 "teacher_path": str(teacher) if teacher.exists() else None,
@@ -1451,11 +1961,27 @@ async def distill_snapshot_teacher(req: DistillSnapshotRequest, background_tasks
     if req.merge_lora:
         lora_path = _lora_path_for_speaker(req.speaker)
         if lora_path is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"merge_lora=True but no S2Mel LoRA found for {req.speaker}. "
-                       f"Either train an S2Mel LoRA first or pass merge_lora=False.",
-            )
+            # Distinguish "they have a character LoRA but not an S2Mel one" from
+            # "they have nothing at all" — the user shouldn't be told to train
+            # something they don't need.
+            has_gpt_lora = _find_gpt_lora_for_speaker(req.speaker) is not None
+            if has_gpt_lora:
+                detail = (
+                    f"merge_lora=True but no S2Mel (CFM-side) LoRA found for {req.speaker}. "
+                    f"Note: this is a different LoRA from the character LoRA you trained on "
+                    f"the Speakers tab. The character LoRA targets the GPT (which mel tokens "
+                    f"to emit) — it's loaded automatically at pair-generation time and does "
+                    f"NOT need to be merged into the teacher snapshot. "
+                    f"For most workflows: leave 'Merge LoRA' OFF and let the pair-gen step "
+                    f"auto-load your character LoRA."
+                )
+            else:
+                detail = (
+                    f"merge_lora=True but no S2Mel LoRA found for {req.speaker}. "
+                    f"S2Mel LoRA training is rarely needed — leave 'Merge LoRA' OFF unless "
+                    f"you've specifically trained one with tools/train_s2mel_lora.py."
+                )
+            raise HTTPException(status_code=400, detail=detail)
         cmd.extend(["--merge-lora", str(lora_path)])
 
     task_id = _new_distill_task("snapshot", req.speaker)
@@ -1773,6 +2299,13 @@ async def distill_generate_pairs(req: DistillPairsRequest, background_tasks: Bac
         "--teacher-steps", str(req.teacher_steps),
         "--teacher-cfg", str(req.teacher_cfg),
     ]
+    # Auto-load only the real (new) character LoRA. Legacy verbatim/pattern
+    # adapters were trained on a different input distribution (verbatim text)
+    # and would inject wrong behavior into the teacher during pair-gen on
+    # clean manifest text — better to run without a LoRA than with the wrong one.
+    gpt_lora_info = _classify_gpt_lora(req.speaker)
+    if gpt_lora_info and gpt_lora_info["kind"] == "character":
+        cmd.extend(["--gpt-lora", str(gpt_lora_info["path"])])
     if req.limit:
         cmd.extend(["--limit", str(req.limit)])
 
@@ -1900,9 +2433,21 @@ async def distill_activate(req: DistillActivateRequest):
     # Use copy (not symlink) — IndexTTS2 reads via torch.load on a path; a symlink
     # would work too, but a real file is more obvious in the checkpoints dir.
     shutil.copy2(student, active)
+
+    # Sidecar so we don't have to guess "which speaker is active?" later. All
+    # students share the same architecture and therefore byte size, so size
+    # equality is unreliable; the head-hash here is the authoritative tag.
+    meta_path = _active_student_meta_path()
+    meta_path.write_text(json.dumps({
+        "speaker": req.speaker,
+        "source_path": str(student),
+        "activated_at": datetime.now().isoformat(),
+        "sha256_head": _file_head_sha256(active),
+    }, indent=2))
     return {
         "status": "ok",
         "active_path": str(active),
+        "speaker": req.speaker,
         "note": "Reload the base model (/models/load/base) for the new student to take effect.",
     }
 
@@ -1919,23 +2464,11 @@ async def distill_active_status():
     on_disk = active_path.exists()
     on_disk_size_mb = round(active_path.stat().st_size / 1024 / 1024, 1) if on_disk else 0
 
-    # Which speaker, if any, owns this active checkpoint? Compare file size as a cheap
-    # heuristic — student.pth files are large enough that size collisions are negligible.
-    speaker_match = None
-    if on_disk:
-        training_dir = PROJECT_ROOT / "training"
-        if training_dir.exists():
-            target_size = active_path.stat().st_size
-            for sp in training_dir.iterdir():
-                if not sp.is_dir():
-                    continue
-                cand = sp / "cfm_reflow_student" / "best.pth"
-                try:
-                    if cand.exists() and cand.stat().st_size == target_size:
-                        speaker_match = sp.name
-                        break
-                except Exception:
-                    continue
+    # Resolve which speaker owns this active checkpoint via the sidecar manifest
+    # (preferred) with a head-hash fallback. The old byte-size heuristic returned
+    # the alphabetically-first speaker since CFM students share architecture and
+    # therefore byte size.
+    speaker_match = _resolve_active_student_speaker() if on_disk else None
 
     # Is the LOADED model actually using the distilled checkpoint? IndexTTS2 stores the
     # path it was constructed with on self.s2mel_distilled_checkpoint.
@@ -1971,9 +2504,16 @@ async def distill_active_status():
 @app.post("/distill/deactivate")
 async def distill_deactivate():
     active = _active_student_path()
+    meta = _active_student_meta_path()
+    removed = []
     if active.exists():
         active.unlink()
-        return {"status": "ok", "removed": str(active)}
+        removed.append(str(active))
+    if meta.exists():
+        meta.unlink()
+        removed.append(str(meta))
+    if removed:
+        return {"status": "ok", "removed": removed}
     return {"status": "ok", "removed": None, "note": "no active student to remove"}
 
 

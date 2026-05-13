@@ -61,6 +61,9 @@ function switchTab(tabName) {
     } else if (tabName === 'distill') {
         distillInitOnce();
         distillRefresh();
+    } else if (tabName === 'speakers') {
+        speakersInitOnce();
+        speakersRefresh();
     } else if (tabName === 'inference') {
         refreshInferDistillStatus();
     }
@@ -346,38 +349,57 @@ async function loadSpeakers() {
         const speakerSelect = document.getElementById('speakerSelect');
         speakerSelect.innerHTML = '<option value="">None (use audio file)</option>';
 
-        // Also populate the Test Lab speaker dropdown (mirrors trained-speakers list).
+        // Mirror the same list on the Test Lab tab.
         const labSpeakerSelect = document.getElementById('lab-speaker');
-        if (labSpeakerSelect) {
-            labSpeakerSelect.innerHTML = '<option value="">None</option>';
-        }
+        if (labSpeakerSelect) labSpeakerSelect.innerHTML = '<option value="">None</option>';
 
-        speakers.forEach(speaker => {
-            if (speaker.has_patterns) {
-                const option = document.createElement('option');
-                option.value = speaker.name;
-                option.textContent = `${speaker.name} ${speaker.has_patterns ? '(with patterns)' : ''}`;
-                speakerSelect.appendChild(option);
-
-                if (labSpeakerSelect) {
-                    const labOption = option.cloneNode(true);
-                    labSpeakerSelect.appendChild(labOption);
-                }
+        // Show every speaker the model can actually load — character LoRA, patterns,
+        // or stored embeddings. Old UI filtered by has_patterns and hid all the new
+        // character-LoRA speakers.
+        const loadable = speakers.filter(s => s.is_loadable);
+        const kindBadge = {
+            character: 'char-LoRA',
+            verbatim: 'legacy (verbatim)',
+            legacy_pattern: 'legacy (pattern)',
+        };
+        loadable.forEach(speaker => {
+            const tags = [];
+            if (speaker.gpt_lora_kind) tags.push(kindBadge[speaker.gpt_lora_kind] || 'lora');
+            if (speaker.has_patterns) tags.push('patterns');
+            if (speaker.is_active_student) tags.push('⚡ distilled');
+            const label = tags.length ? `${speaker.name} — ${tags.join(' · ')}` : speaker.name;
+            const opt = document.createElement('option');
+            opt.value = speaker.name;
+            opt.textContent = label;
+            speakerSelect.appendChild(opt);
+            if (labSpeakerSelect) {
+                const clone = opt.cloneNode(true);
+                labSpeakerSelect.appendChild(clone);
             }
         });
 
-        // Update speakers list in Models tab
+        // Models tab speakers list — same enriched info.
         const speakersList = document.getElementById('speakersList');
+        if (!speakersList) return;
         if (speakers.length === 0) {
-            speakersList.innerHTML = '<p class="text-muted">No trained speakers found</p>';
+            speakersList.innerHTML = '<p class="text-muted">No speakers found. Go to the <strong>Speakers</strong> tab to create one.</p>';
         } else {
-            speakersList.innerHTML = speakers.map(speaker => `
+            const loraBadge = (kind) => {
+                if (kind === 'character') return '<span class="badge badge-success" title="Trained on clean text with masked stutter loss — works with voice-to-voice clean-text input.">Character LoRA</span>';
+                if (kind === 'verbatim') return '<span class="badge" style="background:#fdcb6e; color:#3d2c00;" title="Legacy LoRA from train_verbatim_lora.py. Loads, but was trained on verbatim text; may under-stutter on clean input.">Legacy LoRA (verbatim)</span>';
+                if (kind === 'legacy_pattern') return '<span class="badge" style="background:#fdcb6e; color:#3d2c00;" title="Legacy LoRA from the old pattern+LoRA combo trainer. Loads via back-compat path.">Legacy LoRA (pattern)</span>';
+                return '';
+            };
+            speakersList.innerHTML = speakers.map(s => `
                 <div class="speaker-item">
                     <div class="model-info">
-                        <div class="model-name">${speaker.name}</div>
+                        <div class="model-name">${s.name}${s.is_active_student ? ' ⚡' : ''}</div>
                         <div class="model-badges">
-                            ${speaker.has_embeddings ? '<span class="badge badge-info">Embeddings</span>' : ''}
-                            ${speaker.has_patterns ? '<span class="badge badge-success">Patterns</span>' : ''}
+                            ${loraBadge(s.gpt_lora_kind)}
+                            ${s.has_patterns ? '<span class="badge badge-info">Patterns</span>' : ''}
+                            ${s.has_embeddings ? '<span class="badge badge-info">Embeddings</span>' : ''}
+                            ${s.has_distilled_student ? '<span class="badge badge-info">Distilled</span>' : ''}
+                            ${s.n_audio_files ? `<span class="badge">${s.n_audio_files} clips</span>` : ''}
                         </div>
                     </div>
                 </div>
@@ -446,7 +468,10 @@ async function generateSpeech() {
     const text = document.getElementById('inferenceText').value.trim();
     const audioFile = document.getElementById('referenceAudio').files[0];
     const speaker = document.getElementById('speakerSelect').value;
-    const usePatterns = document.getElementById('usePatternsCheckbox').checked;
+    // Implicit: whenever a speaker is picked we let the server apply patterns /
+    // character LoRA / embeddings if it has them. The old explicit toggle was
+    // confusing and is gone.
+    const usePatterns = !!speaker;
 
     if (!text) {
         showNotification('Please enter text to synthesize', 'error');
@@ -543,12 +568,11 @@ async function streamSpeech() {
     const text = document.getElementById('inferenceText').value.trim();
     const audioFile = document.getElementById('referenceAudio').files[0];
     const speaker = document.getElementById('speakerSelect').value;
-    const usePatterns = document.getElementById('usePatternsCheckbox').checked;
+    const usePatterns = !!speaker;  // server applies whatever artifacts the speaker has
 
     // --- Validation ---
     if (!text) { showNotification('Please enter text to synthesize', 'error'); return; }
     if (!audioFile && !speaker) { showNotification('Please upload reference audio or select a speaker', 'error'); return; }
-    if (usePatterns && !speaker) { showNotification('Pattern embeddings require a trained speaker', 'error'); return; }
     if (!usePatterns && !audioFile) { showNotification('Please upload reference audio when not using patterns', 'error'); return; }
 
     const streamBtn = document.getElementById('streamBtn');
@@ -1405,7 +1429,7 @@ async function distillRefresh() {
         const select = document.getElementById('distill-speaker');
         const prev = select.value;
         select.innerHTML = distillSpeakers
-            .map(s => `<option value="${s.name}">${s.name}${s.has_lora ? '' : ' (no LoRA)'}${s.is_active_student ? ' ⚡' : ''}</option>`)
+            .map(s => `<option value="${s.name}">${s.name}${s.has_character_lora ? '' : ' (no character LoRA)'}${s.is_active_student ? ' ⚡' : ''}</option>`)
             .join('');
         if (prev && distillSpeakers.find(s => s.name === prev)) select.value = prev;
 
@@ -1456,8 +1480,18 @@ function distillRenderStatus() {
         target.innerHTML = '<div class="distill-status-item missing">No speaker selected</div>';
         return;
     }
+    // Render the two LoRA types as separate rows so the user never confuses
+    // them. Character LoRA = GPT-side (Speakers tab artifact, auto-loaded at
+    // pair-gen). S2Mel LoRA = CFM-side, only shown when present.
+    const hasChar = !!sp.has_character_lora;
+    const kind = sp.gpt_lora_kind;
+    let gptLoraText;
+    if (kind === 'character') gptLoraText = 'yes — auto-loaded at pair-gen';
+    else if (kind === 'verbatim') gptLoraText = 'legacy (verbatim) — won\'t help on clean text';
+    else if (kind === 'legacy_pattern') gptLoraText = 'legacy (pattern combo) — won\'t help on clean text';
+    else gptLoraText = 'missing';
     const items = [
-        ['has_lora', 'S2Mel LoRA', sp.has_lora ? 'yes' : 'missing'],
+        ['has_char_lora', 'Character LoRA (GPT)', gptLoraText],
         ['has_csv', 'Verbatim CSV', sp.has_csv ? 'yes' : 'missing'],
         ['has_teacher', 'Teacher snapshot', sp.has_teacher ? 'yes' : 'missing'],
         ['has_manifest', 'Reflow manifest', sp.has_manifest ? `${sp.manifest_entries} entries` : 'missing'],
@@ -1465,13 +1499,52 @@ function distillRenderStatus() {
         ['has_student', 'Student checkpoint', sp.has_student ? 'yes' : 'missing'],
         ['is_active', 'Active right now', sp.is_active_student ? '⚡ YES' : 'no'],
     ];
-    target.innerHTML = items.map(([k, label, val]) => {
+    // S2Mel LoRA row only when one actually exists — keeps the panel uncluttered
+    // for the common case where it doesn't.
+    if (sp.has_s2mel_lora) {
+        items.splice(1, 0, ['has_s2mel_lora', 'S2Mel LoRA (rare, CFM-side)', 'present — toggle "Merge S2Mel LoRA" on Snapshot if you want it baked in']);
+    }
+    let html = items.map(([k, label, val]) => {
         let cls = 'distill-status-item';
         if (k === 'is_active' && sp.is_active_student) cls += ' active';
         else if (val === 'missing' || val === 'none') cls += ' missing';
         else cls += ' ok';
-        return `<div class="${cls}"><div class="label">${label}</div><div class="value">${val}</div></div>`;
+        // Visually flag legacy LoRA kinds even though they're not "missing".
+        const inlineStyle = (k === 'has_char_lora' && (kind === 'verbatim' || kind === 'legacy_pattern'))
+            ? ' style="background:#ffeaa7; color:#5e4d10;"' : '';
+        return `<div class="${cls}"${inlineStyle}><div class="label">${label}</div><div class="value">${val}</div></div>`;
     }).join('');
+
+    // Contextual hint about how the character LoRA flows through distillation.
+    // Surfaced ONLY when relevant so it doesn't add noise.
+    if (hasChar) {
+        html += `<div style="grid-column: 1 / -1; margin-top: 8px; padding: 10px 12px;
+                background: #d6f5e9; color: #0a3d2c; border-radius: 6px; font-size: 13px;">
+            ✓ Character LoRA detected for <strong>${sp.name}</strong>.
+            It will be auto-loaded into the teacher during pair generation —
+            <em>leave "Merge S2Mel LoRA" unchecked</em> on the Snapshot card below.
+            That checkbox is for a different, rarely-used CFM-side LoRA.
+        </div>`;
+    } else if (kind === 'verbatim' || kind === 'legacy_pattern') {
+        html += `<div style="grid-column: 1 / -1; margin-top: 8px; padding: 10px 12px;
+                background: #ffeaa7; color: #5e4d10; border-radius: 6px; font-size: 13px;">
+            ⚠️ <strong>${sp.name}</strong> has a <strong>legacy ${kind === 'verbatim' ? 'verbatim' : 'pattern-combo'} LoRA</strong>,
+            not the new character LoRA. It will load at inference time for back-compat, but it
+            <em>will NOT be auto-loaded at pair-gen</em> because it was trained on a different input
+            distribution (verbatim text, not clean). The distilled student would inherit the wrong
+            behavior. For character to survive distillation, retrain via the
+            <strong>Speakers</strong> tab to produce a real <code>character_lora/</code>.
+        </div>`;
+    } else if (sp.has_csv) {
+        html += `<div style="grid-column: 1 / -1; margin-top: 8px; padding: 10px 12px;
+                background: #ffeaa7; color: #5e4d10; border-radius: 6px; font-size: 13px;">
+            No character LoRA found for <strong>${sp.name}</strong>. Distillation will work
+            but the student will only learn to render <em>clean</em> speech. For voice character
+            (stutters, pauses, fillers) train a character LoRA first via the
+            <strong>Speakers</strong> tab.
+        </div>`;
+    }
+    target.innerHTML = html;
 
     // Stage badges
     setBadge('snapshot', sp.has_teacher);
@@ -1870,3 +1943,555 @@ function startGpuStatsPolling() {
 }
 
 document.addEventListener('DOMContentLoaded', startGpuStatsPolling);
+
+
+// ============================================================================
+// Speakers tab — end-to-end character LoRA pipeline
+// ============================================================================
+let speakersInitialized = false;
+const speakersActivePolls = {};
+
+function speakersInitOnce() {
+    if (speakersInitialized) return;
+    speakersInitialized = true;
+
+    document.getElementById('speakers-refresh-btn').addEventListener('click', speakersRefresh);
+    document.getElementById('speakers-new-btn').addEventListener('click', speakersCreateNew);
+    document.getElementById('speakers-select').addEventListener('change', () => {
+        speakersRenderStatus();
+        speakersPopulateAudioList();
+    });
+
+    document.getElementById('speakers-upload-btn').addEventListener('click', speakersUploadAudio);
+    document.getElementById('speakers-transcribe-btn').addEventListener('click', speakersTranscribe);
+    document.getElementById('speakers-prep-btn').addEventListener('click', speakersPrepareDataset);
+    document.getElementById('speakers-sanity-btn').addEventListener('click', () => speakersTrain(true));
+    document.getElementById('speakers-train-btn').addEventListener('click', () => speakersTrain(false));
+    document.getElementById('speakers-diagnose-btn').addEventListener('click', speakersDiagnose);
+
+    document.getElementById('speakers-goto-inference-btn').addEventListener('click', () => {
+        const sp = speakersCurrent();
+        if (sp) {
+            // Best-effort: switch the Inference tab speaker dropdown if it exists.
+            const inferSel = document.getElementById('speaker') || document.getElementById('inferSpeaker');
+            if (inferSel) {
+                const opt = Array.from(inferSel.options).find(o => o.value === sp);
+                if (opt) inferSel.value = sp;
+            }
+        }
+        switchTab('inference');
+    });
+    document.getElementById('speakers-goto-distill-btn').addEventListener('click', () => {
+        const sp = speakersCurrent();
+        switchTab('distill');
+        if (sp) {
+            // Wait for distill init then pick this speaker
+            setTimeout(() => {
+                const sel = document.getElementById('distill-speaker');
+                if (sel && Array.from(sel.options).some(o => o.value === sp)) {
+                    sel.value = sp;
+                    sel.dispatchEvent(new Event('change'));
+                }
+            }, 200);
+        }
+    });
+}
+
+function speakersCurrent() {
+    const el = document.getElementById('speakers-select');
+    return el ? el.value : null;
+}
+
+async function speakersRefresh() {
+    try {
+        // Reuse the distill speakers endpoint — it already enumerates training/<speaker>/.
+        const data = await fetchJSON('/distill/speakers');
+        const speakers = data.speakers || [];
+
+        const select = document.getElementById('speakers-select');
+        const prev = select.value;
+        select.innerHTML = speakers
+            .map(s => `<option value="${s.name}">${s.name}${s.has_character_lora ? ' • lora' : ''}${s.is_active_student ? ' ⚡' : ''}</option>`)
+            .join('');
+        if (prev && speakers.find(s => s.name === prev)) select.value = prev;
+
+        await speakersRenderStatus();
+        await speakersPopulateAudioList();
+    } catch (e) {
+        showNotification(`Failed to load speakers: ${e.message}`, 'error');
+    }
+}
+
+async function speakersRenderStatus() {
+    const sp = speakersCurrent();
+    const out = document.getElementById('speakers-status');
+    if (!sp) {
+        out.textContent = 'No speaker selected.';
+        return;
+    }
+    try {
+        const s = await fetchJSON(`/character/status?speaker=${encodeURIComponent(sp)}`);
+        const dot = (ok) => ok ? '<span style="color:#00b894;">●</span>' : '<span style="color:#b2bec3;">○</span>';
+        out.innerHTML = `
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px;">
+                <div>${dot(s.n_audio_files > 0)} <strong>Audio</strong>: ${s.n_audio_files} files</div>
+                <div>${dot(s.has_clean_transcripts && s.has_verbatim_transcripts)} <strong>Transcripts</strong></div>
+                <div>${dot(s.n_manifest_entries > 0)} <strong>Dataset</strong>: ${s.n_manifest_entries} samples</div>
+                <div>${dot(s.has_character_lora)} <strong>Character LoRA</strong></div>
+                <div>${dot(s.has_teacher_snapshot)} <strong>Teacher snapshot</strong></div>
+                <div>${dot(s.has_distilled_student)} <strong>Distilled student</strong>${s.is_active_student ? ' ⚡' : ''}</div>
+            </div>
+        `;
+    } catch (e) {
+        out.textContent = `(could not load status: ${e.message})`;
+    }
+}
+
+async function speakersPopulateAudioList() {
+    const sp = speakersCurrent();
+    const dl = document.getElementById('speakers-audio-list');
+    if (!sp || !dl) return;
+    try {
+        const r = await fetchJSON(`/distill/list-audio?speaker=${encodeURIComponent(sp)}`);
+        dl.innerHTML = (r.files || []).map(f => `<option value="${f}"></option>`).join('');
+    } catch {
+        dl.innerHTML = '';
+    }
+}
+
+async function speakersCreateNew() {
+    const name = prompt('New speaker name (letters/digits/underscore):');
+    if (!name) return;
+    try {
+        const r = await postJSON('/character/create-speaker', { name });
+        showNotification(`Created speaker ${r.speaker}`, 'success');
+        await speakersRefresh();
+        const sel = document.getElementById('speakers-select');
+        if (Array.from(sel.options).some(o => o.value === r.speaker)) {
+            sel.value = r.speaker;
+            sel.dispatchEvent(new Event('change'));
+        }
+    } catch (e) {
+        showNotification(`Create failed: ${e.message}`, 'error');
+    }
+}
+
+async function speakersUploadAudio() {
+    const sp = speakersCurrent();
+    const input = document.getElementById('speakers-audio-upload');
+    const wrap = document.getElementById('speakers-upload-progress');
+    if (!sp) return showNotification('Pick a speaker first.', 'error');
+    if (!input.files || input.files.length === 0) return showNotification('Pick audio files.', 'error');
+
+    wrap.className = 'task-progress active';
+    wrap.innerHTML = `<div>Uploading ${input.files.length} files…</div>`;
+    const fd = new FormData();
+    fd.append('speaker', sp);
+    for (const f of input.files) fd.append('audio_files', f);
+
+    try {
+        const r = await fetch('/character/upload-audio', { method: 'POST', body: fd });
+        if (!r.ok) {
+            const err = await r.text();
+            throw new Error(err);
+        }
+        const data = await r.json();
+        wrap.innerHTML = `<div>✅ Saved ${data.saved.length} file(s). Total in dir: ${data.total_in_dir}.</div>`;
+        input.value = '';
+        await speakersRefresh();
+    } catch (e) {
+        wrap.innerHTML = `<div style="color:#d63031;">❌ ${e.message}</div>`;
+    }
+}
+
+async function speakersTranscribe() {
+    const sp = speakersCurrent();
+    if (!sp) return;
+    const force = document.getElementById('speakers-transcribe-force').checked;
+    try {
+        const r = await postJSON('/character/transcribe', { speaker: sp, force });
+        if (r.status === 'skipped') {
+            const wrap = document.getElementById('speakers-transcribe-progress');
+            wrap.className = 'task-progress active';
+            wrap.innerHTML = `<div>⚠️ ${r.reason}<br>Existing transcripts: <code>${r.path}</code></div>`;
+            return;
+        }
+        speakersStartTaskPoll(r.task_id, 'speakers-transcribe-progress', () => speakersRefresh());
+    } catch (e) {
+        showNotification(`Transcribe failed: ${e.message}`, 'error');
+    }
+}
+
+async function speakersPrepareDataset() {
+    const sp = speakersCurrent();
+    if (!sp) return;
+    const body = {
+        speaker: sp,
+        reference_audio: document.getElementById('speakers-prep-ref').value.trim() || null,
+        pad_tokens: parseInt(document.getElementById('speakers-prep-pad').value, 10) || 8,
+    };
+    const limitVal = document.getElementById('speakers-prep-limit').value;
+    if (limitVal) body.limit = parseInt(limitVal, 10);
+    try {
+        const r = await postJSON('/character/prepare-dataset', body);
+        speakersStartTaskPoll(r.task_id, 'speakers-prep-progress', () => speakersRefresh());
+    } catch (e) {
+        showNotification(`Dataset prep failed: ${e.message}`, 'error');
+    }
+}
+
+async function speakersTrain(overfit) {
+    const sp = speakersCurrent();
+    if (!sp) return;
+    const body = {
+        speaker: sp,
+        epochs: parseInt(document.getElementById('speakers-train-epochs').value, 10),
+        batch_size: parseInt(document.getElementById('speakers-train-batch').value, 10),
+        learning_rate: parseFloat(document.getElementById('speakers-train-lr').value),
+        lora_rank: parseInt(document.getElementById('speakers-train-rank').value, 10),
+        lora_alpha: parseInt(document.getElementById('speakers-train-alpha').value, 10),
+        stutter_weight: parseFloat(document.getElementById('speakers-train-sweight').value),
+        overfit_test: overfit,
+        logit_diff: true,
+    };
+    try {
+        const r = await postJSON('/character/train', body);
+        speakersStartTaskPoll(r.task_id, 'speakers-train-progress', () => speakersRefresh());
+    } catch (e) {
+        showNotification(`Train failed: ${e.message}`, 'error');
+    }
+}
+
+async function speakersDiagnose() {
+    const sp = speakersCurrent();
+    if (!sp) return;
+    const card = document.getElementById('speakers-diagnose-card');
+    card.style.display = 'block';
+    card.innerHTML = '<div style="color:#636e72;">Loading…</div>';
+    try {
+        const r = await fetchJSON(`/character/diagnose?speaker=${encodeURIComponent(sp)}`);
+        card.innerHTML = renderDiagnostic(r);
+    } catch (e) {
+        card.innerHTML = `<div style="background:#fab1a0; color:#2d3436; padding: 12px; border-radius: 6px;">
+            ❌ ${escapeHtml(e.message)}<br>
+            <small>Run training with the "logit_diff" flag — it's on by default from this UI.</small>
+        </div>`;
+    }
+}
+
+// Render the diagnostic card: PASS/FAIL banner + KL meter + per-metric chips +
+// top-k samples table + raw-JSON collapsible.
+function renderDiagnostic(r) {
+    const sc = r.sanity_check || null;
+    const meanKL = r.mean_kl_divergence;
+    const medKL = r.median_kl_divergence;
+    const maxKL = r.max_kl_divergence;
+    const bands = r.kl_bands && r.kl_bands.length ? r.kl_bands : [
+        {label: 'no-op',  min: 0.0,  max: 0.05, color: '#d63031'},
+        {label: 'some',   min: 0.05, max: 0.5,  color: '#fdcb6e'},
+        {label: 'real',   min: 0.5,  max: 2.0,  color: '#00b894'},
+        {label: 'strong', min: 2.0,  max: 8.0,  color: '#0984e3'},
+    ];
+
+    // --- Pass/fail banner ---
+    let banner;
+    if (sc) {
+        if (sc.passed) {
+            const reasonText = (sc.reasons && sc.reasons.length)
+                ? `<br><small style="opacity:.85;">${sc.reasons.map(escapeHtml).join(' · ')}</small>` : '';
+            banner = `<div style="background:#55efc4; color:#0a3d2c; padding: 14px 16px; border-radius: 8px; font-weight: 600;">
+                ✅ PASS — ${escapeHtml(sc.mode || 'run')} thresholds met${reasonText}
+            </div>`;
+        } else {
+            const reasons = (sc.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+            banner = `<div style="background:#fab1a0; color:#3d1a13; padding: 14px 16px; border-radius: 8px;">
+                <div style="font-weight:600;">❌ FAIL — ${escapeHtml(sc.mode || 'run')} thresholds not met</div>
+                <ul style="margin: 6px 0 0 18px; padding: 0;">${reasons || '<li>see metrics below</li>'}</ul>
+            </div>`;
+        }
+    } else {
+        banner = `<div style="background:#dfe6e9; color:#2d3436; padding: 12px 14px; border-radius: 8px;">
+            ℹ️ No sanity_check block in this report (older training run). Re-train to get pass/fail.
+        </div>`;
+    }
+
+    // --- KL meter ---
+    let meter = '';
+    if (meanKL != null) {
+        const scaleMax = Math.max(maxKL || 0, 2.5);  // ensure "real" band always shows
+        const markerPct = Math.min(99, (meanKL / scaleMax) * 100);
+        const bandSpans = bands.map(b => {
+            const lo = Math.min(100, (b.min / scaleMax) * 100);
+            const hi = Math.min(100, (b.max / scaleMax) * 100);
+            const width = Math.max(0, hi - lo);
+            return `<div style="position:absolute; left:${lo}%; width:${width}%; height:100%; background:${b.color}; opacity: .6;"></div>`;
+        }).join('');
+        const bandLabels = bands.map(b => {
+            const cx = Math.min(100, ((b.min + b.max) / 2 / scaleMax) * 100);
+            return `<span style="position:absolute; left:${cx}%; transform: translateX(-50%); top: 0; font-size: 10px; color:#2d3436;">${b.label}</span>`;
+        }).join('');
+
+        meter = `
+            <div style="margin: 14px 0 6px;">
+                <div style="font-size: 12px; color:#636e72; margin-bottom: 4px;">
+                    Distribution shift (mean KL vs base GPT). Higher = LoRA moved the mel-token distribution more.
+                </div>
+                <div style="position: relative; height: 22px; background:#dfe6e9; border-radius: 11px; overflow: hidden;">
+                    ${bandSpans}
+                    <div style="position:absolute; left:${markerPct}%; top:0; bottom:0; width:3px; background:#2d3436;"></div>
+                </div>
+                <div style="position: relative; height: 14px; margin-top: 2px;">${bandLabels}</div>
+                <div style="display:flex; gap: 12px; margin-top: 8px; font-size: 12px; color:#2d3436;">
+                    <span><strong>mean</strong> ${meanKL.toFixed(3)}</span>
+                    <span><strong>median</strong> ${medKL != null ? medKL.toFixed(3) : '—'}</span>
+                    <span><strong>max</strong> ${maxKL != null ? maxKL.toFixed(3) : '—'}</span>
+                    <span style="margin-left:auto; color:#636e72;">scale: 0 – ${scaleMax.toFixed(1)}</span>
+                </div>
+            </div>
+        `;
+    } else {
+        meter = `<div style="margin: 12px 0; padding: 10px; background:#dfe6e9; border-radius: 6px; color:#636e72; font-size: 13px;">
+            KL not measured. Re-run training with the "logit_diff" flag (default on in this UI) to populate the meter.
+        </div>`;
+    }
+
+    // --- Per-metric chips ---
+    const chip = (label, value, ok) => {
+        const bg = ok == null ? '#dfe6e9' : (ok ? '#55efc4' : '#fab1a0');
+        const fg = ok == null ? '#2d3436' : (ok ? '#0a3d2c' : '#3d1a13');
+        return `<div style="background:${bg}; color:${fg}; padding: 8px 12px; border-radius: 6px; font-size: 13px;">
+            <div style="font-size: 11px; opacity: .75;">${label}</div>
+            <div style="font-weight: 600; font-size: 15px;">${value}</div>
+        </div>`;
+    };
+    const lossVal = sc && sc.final_loss != null ? sc.final_loss : null;
+    const stVal = sc && sc.final_stutter_top1 != null ? sc.final_stutter_top1 : null;
+    const lossChip = lossVal == null ? chip('final loss', '—', null)
+        : chip('final loss', lossVal.toFixed(4),
+               sc && sc.mode === 'overfit' ? lossVal < 0.5 : lossVal < 5.0);
+    const stChip = stVal == null ? chip('stutter top-1', '—', null)
+        : chip('stutter top-1',
+               (stVal * 100).toFixed(1) + '%',
+               sc && sc.mode === 'overfit' ? stVal > 0.8 : null);
+    const klChip = meanKL == null ? chip('mean KL', '—', null)
+        : chip('mean KL', meanKL.toFixed(3),
+               sc && sc.mode === 'overfit' ? meanKL > 0.5 : meanKL > 0.05);
+    const chips = `<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-top: 8px;">
+        ${lossChip}${stChip}${klChip}
+    </div>`;
+
+    // --- Top-k samples table ---
+    let samplesHtml = '';
+    if (Array.isArray(r.samples) && r.samples.length) {
+        const rows = r.samples.slice(0, 2).map(s => {
+            const ids = s.base_top_ids.slice(0, 5);
+            const baseProbs = s.base_top_probs.slice(0, 5);
+            const loraIds = s.lora_top_ids.slice(0, 5);
+            const loraProbs = s.lora_top_probs.slice(0, 5);
+            return `
+                <div style="border: 1px solid #dfe6e9; border-radius: 6px; padding: 10px; margin-top: 8px;">
+                    <div style="font-size: 12px; color:#636e72; margin-bottom: 6px;">
+                        Sample ${s.sample_idx} @ position ${s.position} — top-5 mel-token candidates
+                    </div>
+                    <table style="width:100%; font-size: 12px; border-collapse: collapse;">
+                        <thead><tr style="text-align: left;">
+                            <th style="padding: 4px;">rank</th>
+                            <th style="padding: 4px;">base (no LoRA)</th>
+                            <th style="padding: 4px;">prob</th>
+                            <th style="padding: 4px;">with LoRA</th>
+                            <th style="padding: 4px;">prob</th>
+                        </tr></thead>
+                        <tbody>
+                            ${ids.map((id, i) => `
+                                <tr style="border-top: 1px solid #f0f3f4;">
+                                    <td style="padding: 4px; color:#636e72;">${i + 1}</td>
+                                    <td style="padding: 4px; font-family: monospace;">${ids[i]}</td>
+                                    <td style="padding: 4px; font-family: monospace;">${baseProbs[i]}</td>
+                                    <td style="padding: 4px; font-family: monospace; ${loraIds[i] !== ids[i] ? 'background:#ffeaa7;' : ''}">${loraIds[i]}</td>
+                                    <td style="padding: 4px; font-family: monospace;">${loraProbs[i]}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }).join('');
+        samplesHtml = `<details style="margin-top: 12px;"><summary style="cursor: pointer; font-size: 13px; color:#0984e3;">Per-sample top-k mel-token comparison</summary>${rows}</details>`;
+    }
+
+    // --- Interpretation hint + raw JSON ---
+    const interp = r.interpretation
+        ? `<div style="margin-top: 10px; font-size: 12px; color:#636e72; font-style: italic;">${escapeHtml(r.interpretation)}</div>`
+        : '';
+
+    const raw = `<details style="margin-top: 12px;"><summary style="cursor: pointer; font-size: 12px; color:#636e72;">Raw report JSON</summary>
+        <pre style="background:#2d3436; color:#dfe6e9; padding: 10px; border-radius: 6px; font-size: 11px; max-height: 320px; overflow: auto;">${escapeHtml(JSON.stringify(r, null, 2))}</pre>
+    </details>`;
+
+    return `${banner}${meter}${chips}${interp}${samplesHtml}${raw}`;
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+}
+
+// Standalone task poller for the Speakers tab. Writes its own log tail into
+// the wrap element so we don't depend on the distill tab's DOM.
+function speakersStartTaskPoll(taskId, wrapId, onComplete) {
+    const wrap = document.getElementById(wrapId);
+    wrap.className = 'task-progress active';
+    wrap.innerHTML = `
+        <div><strong>${taskId}</strong> queued…</div>
+        <div class="bar" style="background:#dfe6e9; height:6px; border-radius:3px; overflow:hidden; margin:6px 0;">
+            <div class="bar-fill" style="width:0%; height:100%; background:#0984e3; transition: width .25s;"></div>
+        </div>
+        <div class="meta" style="font-size:12px; color:#636e72;">
+            <span class="status-text">starting</span> — <span class="msg-text"></span>
+        </div>
+        <pre class="log-tail" style="margin-top:8px; max-height:240px; overflow:auto; background:#2d3436; color:#dfe6e9; padding:8px; border-radius:6px; font-size:11px;"></pre>
+    `;
+
+    if (speakersActivePolls[taskId]) clearInterval(speakersActivePolls[taskId]);
+
+    speakersActivePolls[taskId] = setInterval(async () => {
+        try {
+            const t = await fetchJSON(`/distill/tasks/${taskId}?log_lines=300`);
+            const pct = Math.round((t.progress || 0) * 100);
+            wrap.querySelector('.bar-fill').style.width = pct + '%';
+            wrap.querySelector('.status-text').textContent = `${t.status} (${pct}%)`;
+            wrap.querySelector('.msg-text').textContent = t.message || '';
+            const log = wrap.querySelector('.log-tail');
+            if (log && t.log_tail) {
+                log.textContent = t.log_tail.join('\n');
+                log.scrollTop = log.scrollHeight;
+            }
+            if (['completed', 'failed', 'cancelled'].includes(t.status)) {
+                clearInterval(speakersActivePolls[taskId]);
+                delete speakersActivePolls[taskId];
+                if (onComplete) try { onComplete(t); } catch (e) { console.error(e); }
+            }
+        } catch (e) {
+            console.error('speakers poll', e);
+        }
+    }, 2000);
+}
+
+
+// ============================================================================
+// Inference tab: model status widget (replaces the retired Models tab)
+// ============================================================================
+let modelStatusInitialized = false;
+let _loadedSpeakerForWidget = null;  // best-effort cache; server is the truth
+
+function _setModelWidgetState(opts) {
+    const text = document.getElementById('modelStatusText');
+    const loadBtn = document.getElementById('modelLoadBtn');
+    const reloadBtn = document.getElementById('modelReloadBtn');
+    if (!text || !loadBtn || !reloadBtn) return;
+    text.innerHTML = opts.html ?? text.innerHTML;
+    loadBtn.style.display = opts.showLoad ? '' : 'none';
+    reloadBtn.style.display = opts.showReload ? '' : 'none';
+}
+
+async function refreshModelStatus() {
+    const widget = document.getElementById('modelStatusWidget');
+    if (!widget) return;
+    try {
+        const h = await fetchJSON('/health');
+        if (!h.model_loaded) {
+            _setModelWidgetState({
+                html: '<span style="color:#5e4d10;"><strong>Base model not loaded.</strong> '
+                    + 'Click <em>Load base model</em> — takes 30–60s the first time.</span>',
+                showLoad: true, showReload: false,
+            });
+            widget.style.background = '#ffeaa7';
+            return;
+        }
+        // Loaded — show active LoRA if we know it
+        const lora = _loadedSpeakerForWidget
+            ? `· LoRA: <strong>${_loadedSpeakerForWidget}</strong>`
+            : '· no speaker LoRA loaded';
+        _setModelWidgetState({
+            html: `<span style="color:#0a3d2c;">✓ Base model loaded (${h.device}) ${lora}</span>`,
+            showLoad: false, showReload: true,
+        });
+        widget.style.background = '#d6f5e9';
+    } catch (e) {
+        _setModelWidgetState({
+            html: `<span style="color:#5e4d10;">Status check failed: ${escapeHtml(e.message)}</span>`,
+            showLoad: true, showReload: false,
+        });
+        widget.style.background = '#ffeaa7';
+    }
+}
+
+async function loadOrReloadBase() {
+    const widget = document.getElementById('modelStatusWidget');
+    _setModelWidgetState({
+        html: '<span style="color:#2d3436;">⏳ Loading base model… (30–60s, CUDA graphs + JIT)</span>',
+        showLoad: false, showReload: false,
+    });
+    if (widget) widget.style.background = '#dfe6e9';
+    try {
+        await postJSON('/models/load/base', {});
+        _loadedSpeakerForWidget = null;
+        showNotification('Base model loaded', 'success');
+        await refreshModelStatus();
+        // If a speaker is currently selected on the Inference tab, re-merge its LoRA now
+        const sp = document.getElementById('speakerSelect')?.value;
+        if (sp) await loadSpeakerLora(sp);
+    } catch (e) {
+        showNotification(`Load failed: ${e.message}`, 'error');
+        await refreshModelStatus();
+    }
+}
+
+async function loadSpeakerLora(speaker) {
+    if (!speaker) {
+        _loadedSpeakerForWidget = null;
+        await refreshModelStatus();
+        return;
+    }
+    // Skip the request if we believe this speaker's LoRA is already merged.
+    if (_loadedSpeakerForWidget === speaker) return;
+
+    const widget = document.getElementById('modelStatusWidget');
+    const prevBg = widget?.style.background;
+    _setModelWidgetState({
+        html: `<span style="color:#2d3436;">⏳ Loading LoRA for <strong>${escapeHtml(speaker)}</strong>…</span>`,
+        showLoad: false, showReload: false,
+    });
+    if (widget) widget.style.background = '#dfe6e9';
+    try {
+        const r = await fetch(`/models/load/${encodeURIComponent(speaker)}`, { method: 'POST' });
+        if (!r.ok) {
+            const t = await r.text().catch(() => r.statusText);
+            throw new Error(t);
+        }
+        _loadedSpeakerForWidget = speaker;
+        showNotification(`LoRA loaded: ${speaker}`, 'success');
+    } catch (e) {
+        // Common case: base model isn't loaded yet
+        showNotification(`Speaker LoRA load failed: ${e.message}`, 'error');
+        if (widget && prevBg) widget.style.background = prevBg;
+    } finally {
+        await refreshModelStatus();
+    }
+}
+
+function initModelStatusWidget() {
+    if (modelStatusInitialized) return;
+    modelStatusInitialized = true;
+    const loadBtn = document.getElementById('modelLoadBtn');
+    const reloadBtn = document.getElementById('modelReloadBtn');
+    if (loadBtn) loadBtn.addEventListener('click', loadOrReloadBase);
+    if (reloadBtn) reloadBtn.addEventListener('click', loadOrReloadBase);
+    const sel = document.getElementById('speakerSelect');
+    if (sel) sel.addEventListener('change', () => loadSpeakerLora(sel.value));
+    refreshModelStatus();
+    // Light polling so the badge stays in sync if the server was restarted by --reload
+    setInterval(refreshModelStatus, 15000);
+}
+
+document.addEventListener('DOMContentLoaded', initModelStatusWidget);

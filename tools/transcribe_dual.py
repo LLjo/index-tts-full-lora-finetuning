@@ -30,10 +30,22 @@ import sys
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# numpy 2.0 removed `np.sctypes`, but NeMo's preprocessing.segment still uses it
+# to detect integer dtypes. Restore the dict NeMo expects BEFORE any nemo import.
+# Purely additive — harmless if NeMo is later updated to drop the reference.
+import numpy as _np
+if not hasattr(_np, "sctypes"):
+    _np.sctypes = {
+        "int":     [_np.int8, _np.int16, _np.int32, _np.int64],
+        "uint":    [_np.uint8, _np.uint16, _np.uint32, _np.uint64],
+        "float":   [_np.float16, _np.float32, _np.float64],
+        "complex": [_np.complex64, _np.complex128],
+        "others":  [bool, object, bytes, str, _np.void],
+    }
+
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from datasets import load_dataset
-import torch
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -49,21 +61,26 @@ class DualTranscriber:
         parakeet_model: str = "nvidia/parakeet-tdt-0.6b-v3",
         device: str = "cuda",
         compute_type: str = "float16",
+        strict_parakeet: bool = False,
     ):
         self.device = device
         self.compute_type = compute_type
-        
-        print(f"\n[Transcriber] Initializing on device: {device}")
-        
-        # Load FastWhisper
+        # When True, Parakeet load/transcribe failures raise instead of silently
+        # producing empty cells. Use this from CI / the API so we never silently
+        # ship an all-empty verbatim column again.
+        self.strict_parakeet = strict_parakeet
+
+        print(f"\n[Transcriber] Initializing on device: {device}  strict_parakeet={strict_parakeet}")
+
         print(f"  Loading FastWhisper ({whisper_model})...")
         self._init_whisper(whisper_model)
-        
-        # Load Parakeet
+
         print(f"  Loading Parakeet ({parakeet_model})...")
         self._init_parakeet(parakeet_model)
-        
-        print("  ✓ Both transcribers loaded")
+
+        if self.parakeet is None and strict_parakeet:
+            raise RuntimeError("PARAKEET_LOAD_FAILED: Parakeet did not load (see logs above).")
+        print(f"  ✓ Transcribers loaded  (parakeet={'yes' if self.parakeet is not None else 'NO — verbatim will be empty'})")
     
     def _init_whisper(self, model_name: str):
         """Initialize FastWhisper model."""
@@ -95,12 +112,10 @@ class DualTranscriber:
         """Initialize NVIDIA Parakeet model."""
         try:
             import nemo.collections.asr as nemo_asr
-            
-            # Parakeet models are CTC-based and transcribe verbatim
+
             print(f"    Downloading/loading Parakeet model...")
             self.parakeet = nemo_asr.models.ASRModel.from_pretrained(model_name)
-            
-            # Handle device - NeMo models use .cuda() or .cpu()
+
             if "cuda" in self.device:
                 self.parakeet = self.parakeet.cuda()
             else:
@@ -108,16 +123,24 @@ class DualTranscriber:
             self.parakeet.eval()
             print(f"    ✓ Parakeet loaded successfully")
         except ImportError as e:
-            print(f"  ⚠ NeMo not installed: {e}")
-            print("    Install with: pip install nemo_toolkit[asr]")
-            print("    Or use --skip-parakeet to use FastWhisper for both columns")
+            msg = (
+                f"NeMo / one of its deps failed to import: {e}\n"
+                f"   Typical fixes: pip install nemo_toolkit[asr] lilcom\n"
+                f"   If you saw `pyarrow.PyExtensionType`: upgrade `datasets` to 3.x"
+            )
+            if getattr(self, "strict_parakeet", False):
+                raise RuntimeError(f"PARAKEET_LOAD_FAILED: {msg}") from e
+            print(f"  ⚠ {msg}")
+            print("    Continuing without Parakeet — verbatim column will be empty.")
             self.parakeet = None
         except Exception as e:
-            print(f"  ⚠ Failed to load Parakeet: {e}")
-            print("    Using FastWhisper fallback for verbatim column")
-            self.parakeet = None
             import traceback
-            traceback.print_exc()
+            tb = traceback.format_exc()
+            if getattr(self, "strict_parakeet", False):
+                raise RuntimeError(f"PARAKEET_LOAD_FAILED: {e}\n{tb}") from e
+            print(f"  ⚠ Failed to load Parakeet: {e}")
+            print(tb)
+            self.parakeet = None
     
     def transcribe_whisper(self, audio_path: str) -> str:
         """Transcribe with FastWhisper (clean output)."""
@@ -140,113 +163,67 @@ class DualTranscriber:
         return result["text"]
     
     def transcribe_parakeet(self, audio_path: str) -> str:
-        """Transcribe with Parakeet (verbatim output)."""
+        """Transcribe with Parakeet (verbatim). Returns "" on failure unless
+        strict_parakeet is set, in which case it raises."""
         if self.parakeet is None:
             return ""
-        
+
+        import os
         import tempfile
         import soundfile as sf
         import numpy as np
         import torch
-        
+
+        tmp_path = None
         try:
-            # Load and prepare audio
             audio, sample_rate = sf.read(audio_path)
-            
-            # Convert stereo to mono if necessary
             if len(audio.shape) > 1 and audio.shape[1] > 1:
                 audio = np.mean(audio, axis=1)
-            
-            # Ensure correct sample rate (16kHz for Parakeet)
-            expected_sr = 16000
-            if sample_rate != expected_sr:
-                # Resample if needed
+            if sample_rate != 16000:
                 import librosa
-                audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=expected_sr)
-                sample_rate = expected_sr
-            
-            # Create temporary mono audio file
+                audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
+                sample_rate = 16000
+
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
                 tmp_path = tmp_file.name
                 sf.write(tmp_path, audio, sample_rate)
-            
-            try:
-                # Clear CUDA cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                # Transcribe with timestamps - use batch_size=1
-                results = self.parakeet.transcribe(
-                    [tmp_path],
-                    batch_size=1,
-                    timestamps=True,
-                    return_hypotheses=True,
-                )
-                
-                # Extract results
-                if not results or len(results) == 0:
-                    print(f"Warning: No results for {audio_path}")
-                    return "", [], "en"
-                
-                # Get first hypothesis
-                hyp = results[0]
-                if isinstance(hyp, list):
-                    if len(hyp) == 0:
-                        return "", [], "en"
-                    hyp = hyp[0]
-                
-                # Extract text
-                full_text = getattr(hyp, 'text', '')
-                if not full_text:
-                    return "", [], "en"
-                
-                # # Extract word timestamps
-                # words = []
-                # ts_data = getattr(hyp, 'timestep', None) or getattr(hyp, 'timestamp', None)
-                
-                # if ts_data and isinstance(ts_data, dict) and 'word' in ts_data:
-                #     for word_info in ts_data['word']:
-                #         try:
-                #             word_text = word_info.get('word', '').strip()
-                #             if word_text:  # Skip empty words
-                #                 words.append(WordTiming(
-                #                     word=word_text,
-                #                     start=float(word_info.get('start', 0)),
-                #                     end=float(word_info.get('end', 0)),
-                #                     probability=1.0,
-                #                 ))
-                #         except (KeyError, ValueError, TypeError) as e:
-                #             continue
-                return full_text.strip()#, words, "en"
-            
-            finally:
-                # Cleanup
-                import os
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            results = self.parakeet.transcribe(
+                [tmp_path],
+                batch_size=1,
+                timestamps=True,
+                return_hypotheses=True,
+            )
+
+            if not results:
+                return ""
+            hyp = results[0]
+            if isinstance(hyp, list):
+                if not hyp:
+                    return ""
+                hyp = hyp[0]
+            text = getattr(hyp, 'text', '') or ''
+            return text.strip()
+
+        except Exception as e:
+            if getattr(self, "strict_parakeet", False):
+                raise
+            import traceback
+            print(f"  ! parakeet on {Path(audio_path).name}: {type(e).__name__}: {str(e)[:160]}")
+            traceback.print_exc()
+            return ""
+        finally:
+            if tmp_path:
                 try:
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
-                except:
+                except OSError:
                     pass
-                
-                # Clear CUDA cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
-        except Exception as e:
-            print(f"Error transcribing {audio_path}: {type(e).__name__}: {str(e)[:100]}")
-            return "", [], "en"
-        
-        try:
-            # Parakeet transcribes including stutters and hesitations
-            outputs = self.parakeet.transcribe([audio_path])
-            if outputs and len(outputs) > 0:
-                return outputs[0].strip()
-            return ""
-        except Exception as e:
-            warnings.warn(f"Parakeet failed for {audio_path}: {e}")
-            import traceback
-            traceback.print_exc()
-            return ""
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     def transcribe(self, audio_path: str, use_whisper_fallback: bool = True) -> Dict[str, str]:
         """
@@ -300,7 +277,10 @@ def main():
     # Processing options
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip files already in output CSV")
-    
+    parser.add_argument("--strict-parakeet", action="store_true",
+                        help="Fail loudly (non-zero exit) if Parakeet can't load or transcribe. "
+                             "Use this from the API so we never silently produce an empty verbatim column.")
+
     args = parser.parse_args()
     
     # Resolve paths
@@ -353,6 +333,7 @@ def main():
         parakeet_model=args.parakeet_model,
         device=args.device,
         compute_type=args.compute_type,
+        strict_parakeet=getattr(args, "strict_parakeet", False),
     )
     print("-" * 40)
     
@@ -383,7 +364,21 @@ def main():
         writer.writerows(results)
     
     print(f"\n✓ Saved transcripts to: {output_csv}")
-    
+
+    # Column coverage report — catches "Parakeet silently None'd" and similar.
+    n_total = len(results)
+    n_fw_empty = sum(1 for r in results if not (r.get("fastwhisper") or "").strip())
+    n_pk_empty = sum(1 for r in results if not (r.get("parakeet") or "").strip())
+    print(f"\n[Coverage]  fastwhisper: {n_total - n_fw_empty}/{n_total} non-empty"
+          f"  parakeet: {n_total - n_pk_empty}/{n_total} non-empty")
+    if n_pk_empty == n_total and n_total > 0:
+        print("⚠ Parakeet column is ENTIRELY EMPTY. The downstream character-LoRA dataset "
+              "prep relies on this column to detect stutters — fix Parakeet before "
+              "proceeding (see install hints above) and re-run with --strict-parakeet "
+              "to fail loudly next time.")
+    if n_fw_empty == n_total and n_total > 0:
+        print("⚠ FastWhisper column is ENTIRELY EMPTY. Something went wrong with Whisper.")
+
     # Show sample
     print("\n[Sample Results]")
     for i, row in enumerate(results[:3]):

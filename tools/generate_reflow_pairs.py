@@ -86,6 +86,11 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N manifest entries (for smoke testing).")
     parser.add_argument("--store-fp16", action="store_true", default=True,
                         help="Save tensors as fp16 to halve disk usage (default: True).")
+    parser.add_argument("--gpt-lora", type=Path, default=None,
+                        help="Optional GPT-side LoRA adapter dir (the character LoRA). When set, "
+                             "loaded into the teacher so it emits the speaker's characteristic "
+                             "token sequences during pair-gen — the distilled student then learns "
+                             "to render stuttered output too. Path should contain adapter_config.json.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -190,6 +195,17 @@ def main() -> int:
         use_torch_compile=False,
         s2mel_distilled_checkpoint=str(args.teacher),
     )
+
+    # Optionally merge a GPT-side character LoRA so the teacher emits the
+    # speaker's stutters / pauses / fillers into the token stream. Without this,
+    # the pair-gen run produces (z, x_final) pairs for *clean* speech and the
+    # distilled student never sees the character behavior at all.
+    if args.gpt_lora is not None:
+        if not (args.gpt_lora / "adapter_config.json").exists():
+            print(f">> WARNING: --gpt-lora dir has no adapter_config.json: {args.gpt_lora}")
+        else:
+            print(f">> Loading GPT character LoRA: {args.gpt_lora}")
+            tts.load_lora(str(args.gpt_lora))
 
     save_dtype = torch.float16 if args.store_fp16 else torch.float32
 

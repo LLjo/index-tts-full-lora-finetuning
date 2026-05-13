@@ -43,17 +43,27 @@
                     <span class="tab-icon">🎵</span>
                     Inference
                 </button>
-                <button class="tab-button" data-tab="training">
+                <!-- Legacy Training tab (pattern + LoRA combo) hidden — superseded by the
+                     Speakers tab. The backing endpoints remain so anything in flight
+                     keeps working, but new users go through Speakers. -->
+                <button class="tab-button" data-tab="training" style="display:none;">
                     <span class="tab-icon">🎓</span>
                     Training
                 </button>
-                <button class="tab-button" data-tab="models">
+                <!-- Models tab retired — base-model status now lives on Inference,
+                     speaker list lives on Speakers, badges live on both. Endpoints
+                     /models and /models/load/<name> stay for back-compat scripts. -->
+                <button class="tab-button" data-tab="models" style="display:none;">
                     <span class="tab-icon">📦</span>
                     Models
                 </button>
                 <button class="tab-button" data-tab="testlab">
                     <span class="tab-icon">🧪</span>
                     Test Lab
+                </button>
+                <button class="tab-button" data-tab="speakers">
+                    <span class="tab-icon">🗣️</span>
+                    Speakers
                 </button>
                 <button class="tab-button" data-tab="distill">
                     <span class="tab-icon">⚡</span>
@@ -65,6 +75,13 @@
             <div class="tab-content active" id="inference">
                 <div class="card">
                     <h2>Generate Speech</h2>
+
+                    <!-- Base-model + active-LoRA status. Replaces the old Models tab. -->
+                    <div id="modelStatusWidget" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding: 10px 14px; background:#dfe6e9; border-radius:8px; font-size: 13px; margin-bottom: 12px;">
+                        <span id="modelStatusText" style="flex:1;">Checking model status…</span>
+                        <button type="button" class="btn btn-secondary" id="modelLoadBtn" style="display:none;">📦 Load base model</button>
+                        <button type="button" class="btn btn-secondary" id="modelReloadBtn" style="display:none;">🔄 Reload</button>
+                    </div>
 
                     <!-- Distilled-student status banner (Phase 3). Hidden until populated. -->
                     <div id="inferDistillStatus" class="distill-active-banner" style="display: none;"></div>
@@ -87,18 +104,16 @@
                         </div>
                         
                         <div class="form-group">
-                            <label for="speakerSelect">Or Select Trained Speaker</label>
+                            <label for="speakerSelect">Or pick a trained speaker</label>
                             <select id="speakerSelect">
                                 <option value="">None (use audio file)</option>
                             </select>
+                            <small style="color: #636e72;">
+                                Character LoRA / patterns / embeddings are detected and applied
+                                automatically — no toggle needed. Load the speaker from the Models
+                                tab first if it isn't loaded yet.
+                            </small>
                         </div>
-                    </div>
-
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" id="usePatternsCheckbox">
-                            Use Pattern Embeddings (requires trained speaker)
-                        </label>
                     </div>
 
                     <!-- Advanced Options -->
@@ -475,6 +490,177 @@
                 </div>
             </div>
 
+            <!-- Speakers Tab — character LoRA pipeline -->
+            <div class="tab-content" id="speakers">
+                <div class="card">
+                    <h2>Train a speaker's character</h2>
+                    <p style="color: #636e72; margin-top: -8px;">
+                        End-to-end pipeline that teaches the model a speaker's <em>way of talking</em> —
+                        stutters, pauses, fillers, false starts — while keeping input text clean at
+                        inference so the upstream LLM can write naturally.
+                        Each stage runs as a background job; check the log tail for progress.
+                    </p>
+
+                    <div class="form-row" style="align-items: end;">
+                        <div class="form-group" style="flex: 2;">
+                            <label for="speakers-select">Speaker</label>
+                            <select id="speakers-select"></select>
+                        </div>
+                        <div class="form-group">
+                            <button class="btn btn-secondary" id="speakers-refresh-btn">🔄 Refresh</button>
+                        </div>
+                        <div class="form-group">
+                            <button class="btn btn-secondary" id="speakers-new-btn">➕ New speaker</button>
+                        </div>
+                    </div>
+
+                    <div id="speakers-status" class="distill-status"></div>
+                </div>
+
+                <!-- Stage 1: Audio -->
+                <div class="card distill-stage">
+                    <h2><span class="stage-badge">1</span> Add audio</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Upload audio files for this speaker. They land in
+                        <code>training/&lt;speaker&gt;/dataset/audio/</code>. 1-2 hours of mixed
+                        material produces noticeably better results than 5-10 minutes.
+                    </p>
+                    <input type="file" id="speakers-audio-upload" multiple accept=".wav,.mp3,.flac,.ogg,.m4a" style="display: block; margin-bottom: 8px;">
+                    <button class="btn btn-primary" id="speakers-upload-btn">📤 Upload audio</button>
+                    <div class="task-progress" id="speakers-upload-progress"></div>
+                </div>
+
+                <!-- Stage 2: Transcribe -->
+                <div class="card distill-stage">
+                    <h2><span class="stage-badge">2</span> Transcribe (clean + verbatim)</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Runs <code>transcribe_dual.py</code>: Whisper for clean text (what the LLM
+                        will type at inference) plus Parakeet for verbatim text (stutters preserved,
+                        used as a loss-mask signal during training).
+                    </p>
+                    <div class="form-row" style="align-items: end;">
+                        <div class="form-group">
+                            <label><input type="checkbox" id="speakers-transcribe-force"> Re-transcribe even if outputs exist</label>
+                        </div>
+                        <div class="form-group">
+                            <button class="btn btn-primary" id="speakers-transcribe-btn">📝 Transcribe</button>
+                        </div>
+                    </div>
+                    <div class="task-progress" id="speakers-transcribe-progress"></div>
+                </div>
+
+                <!-- Stage 3: Prepare dataset -->
+                <div class="card distill-stage">
+                    <h2><span class="stage-badge">3</span> Prepare character dataset</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Extracts mel-token targets from each audio file, tokenizes the clean text as
+                        model input, detects stutter/filler/repetition spans by diffing clean vs
+                        verbatim transcripts, and writes a mel-token-aligned stutter mask. This is
+                        what makes per-token loss reweighting possible.
+                    </p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="speakers-prep-ref">Reference audio for global conditioning (recommended)</label>
+                            <input type="text" id="speakers-prep-ref" list="speakers-audio-list" placeholder="pick an exemplar clip">
+                            <datalist id="speakers-audio-list"></datalist>
+                        </div>
+                        <div class="form-group">
+                            <label for="speakers-prep-pad">Stutter mask pad (mel tokens)</label>
+                            <input type="number" id="speakers-prep-pad" min="0" max="64" value="8">
+                        </div>
+                        <div class="form-group">
+                            <label for="speakers-prep-limit">Sample cap (blank = all)</label>
+                            <input type="number" id="speakers-prep-limit" min="1" placeholder="all">
+                        </div>
+                    </div>
+                    <button class="btn btn-primary" id="speakers-prep-btn">📦 Prepare dataset</button>
+                    <div class="task-progress" id="speakers-prep-progress"></div>
+                </div>
+
+                <!-- Stage 4: Train -->
+                <div class="card distill-stage">
+                    <h2><span class="stage-badge">4</span> Train character LoRA</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Trains a GPT-side LoRA with token-level loss reweighting on stutter regions.
+                        Run the <strong>Sanity check</strong> first (2 samples, 200 epochs, ~3 min) to
+                        confirm the loop can actually overfit before burning a real training run.
+                    </p>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="speakers-train-epochs">Epochs</label>
+                            <input type="number" id="speakers-train-epochs" min="1" max="400" value="40">
+                        </div>
+                        <div class="form-group">
+                            <label for="speakers-train-batch">Batch size</label>
+                            <input type="number" id="speakers-train-batch" min="1" max="32" value="2">
+                        </div>
+                        <div class="form-group">
+                            <label for="speakers-train-lr">Learning rate</label>
+                            <input type="number" id="speakers-train-lr" min="0.00001" max="0.01" step="0.00001" value="0.0002">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="speakers-train-rank">LoRA rank</label>
+                            <input type="number" id="speakers-train-rank" min="4" max="128" value="32">
+                        </div>
+                        <div class="form-group">
+                            <label for="speakers-train-alpha">LoRA alpha</label>
+                            <input type="number" id="speakers-train-alpha" min="4" max="256" value="64">
+                        </div>
+                        <div class="form-group">
+                            <label for="speakers-train-sweight">Stutter weight</label>
+                            <input type="number" id="speakers-train-sweight" min="1" max="100" step="0.5" value="15">
+                        </div>
+                    </div>
+                    <div class="button-group">
+                        <button class="btn btn-secondary" id="speakers-sanity-btn">🧪 Sanity check (~3 min)</button>
+                        <button class="btn btn-primary" id="speakers-train-btn">🚀 Train</button>
+                    </div>
+                    <div class="task-progress" id="speakers-train-progress"></div>
+                </div>
+
+                <!-- Stage 5: Diagnose -->
+                <div class="card distill-stage">
+                    <h2><span class="stage-badge">5</span> Diagnose (did it learn anything?)</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        Compares top-k mel-token probabilities with vs without the LoRA on the same
+                        input. KL divergence near zero = the LoRA is a no-op no matter how the audio
+                        sounds. Moderate-to-strong KL = the model's distribution has actually shifted.
+                    </p>
+                    <button class="btn btn-secondary" id="speakers-diagnose-btn">🔍 Show diagnostic</button>
+                    <div id="speakers-diagnose-card" style="display:none; margin-top: 16px;"></div>
+                </div>
+
+                <!-- Stage 6: Next steps -->
+                <div class="card distill-stage">
+                    <h2><span class="stage-badge">6</span> Use it</h2>
+                    <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
+                        <strong>To listen right away:</strong> go to the Inference tab and load this
+                        speaker. The API auto-discovers <code>character_lora/best_checkpoint/lora/</code>
+                        and merges it into the GPT. Use clean text as input — the model adds the
+                        speaker's stutters / pauses on its own.
+                    </p>
+                    <p style="color: #636e72; font-size: 13px;">
+                        <strong>To also get fast TTFA (~150-300ms):</strong> jump to the Distillation tab
+                        and run Snapshot → Manifest → Pairs → Train → Activate. The pair-gen step
+                        <em>automatically loads your character LoRA into the teacher</em>, so the
+                        distilled student learns to render the stuttered tokens. You don't need to
+                        check "Merge LoRA" on the snapshot card — that toggle is for a different,
+                        rarely-used S2Mel-side LoRA. Leave it off.
+                    </p>
+                    <p style="color: #636e72; font-size: 13px;">
+                        <strong>Combined inference at runtime</strong> = base S2Mel + distilled CFM
+                        student (active checkpoint) + character LoRA on the GPT (loaded per-speaker).
+                        All three layers coexist; just load the speaker on the Inference tab.
+                    </p>
+                    <div class="button-group">
+                        <button class="btn btn-secondary" id="speakers-goto-inference-btn">🎵 Go to Inference</button>
+                        <button class="btn btn-secondary" id="speakers-goto-distill-btn">⚡ Go to Distillation (fast TTFA)</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- Distillation Tab -->
             <div class="tab-content" id="distill">
                 <div class="card">
@@ -504,13 +690,22 @@
                 <div class="card distill-stage" id="distill-stage-snapshot">
                     <h2><span class="stage-badge" data-stage="snapshot">1</span> Snapshot teacher CFM</h2>
                     <p style="color: #636e72; font-size: 13px; margin-top: -8px;">
-                        Freezes the current S2Mel weights as the distillation reference. With <strong>Merge LoRA</strong>
-                        on, the speaker's S2Mel LoRA is baked in so the teacher already speaks the trained voice —
-                        required if you want the stutter to survive distillation.
+                        Freezes the current S2Mel weights as the distillation reference. The student
+                        CFM learns to match this teacher in one step. <strong>Don't confuse the two
+                        LoRA types:</strong>
                     </p>
+                    <ul style="color:#636e72; font-size: 13px; margin: 4px 0 12px 18px;">
+                        <li><strong>Character LoRA (GPT-side):</strong> trained from the Speakers
+                            tab. Decides WHICH mel tokens to emit (stutters, fillers, pauses).
+                            <em>Auto-loaded at pair-gen time</em> — nothing to do here.</li>
+                        <li><strong>S2Mel LoRA (CFM-side):</strong> trained by
+                            <code>tools/train_s2mel_lora.py</code> and rarely needed in this repo.
+                            Decides HOW tokens get rendered into mel frames. The checkbox below
+                            merges it into the teacher snapshot — leave OFF if you don't have one.</li>
+                    </ul>
                     <div class="form-row">
                         <div class="form-group">
-                            <label><input type="checkbox" id="distill-merge-lora" checked> Merge speaker's S2Mel LoRA</label>
+                            <label><input type="checkbox" id="distill-merge-lora"> Merge S2Mel LoRA (optional, off by default)</label>
                         </div>
                         <div class="form-group">
                             <label><input type="checkbox" id="distill-snapshot-force"> Overwrite existing snapshot</label>
