@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Wrapper that scrubs the system-CUDA LD_LIBRARY_PATH before exec'ing the
+# given command. Use this for any project command run from a shell that has
+# /usr/local/cuda-13.1/lib64 in LD_LIBRARY_PATH (which conflicts with the
+# project's pip-installed torch+cu128). Example:
+#   ./run python tools/train_gpt_lora.py --config configs/lora.yaml
+#   ./run uv run python tools/train_gpt_lora.py --config configs/lora.yaml
+unset LD_LIBRARY_PATH
+exec "$@"

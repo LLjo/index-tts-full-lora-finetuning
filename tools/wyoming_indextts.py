@@ -68,7 +68,13 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
 from wyoming.info import Attribution, Describe, Info, TtsProgram, TtsVoice
 from wyoming.server import AsyncEventHandler, AsyncServer
-from wyoming.tts import Synthesize
+from wyoming.tts import (
+    Synthesize,
+    SynthesizeStart,
+    SynthesizeChunk,
+    SynthesizeStop,
+    SynthesizeStopped,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -255,6 +261,17 @@ class IndexTTSHandler(AsyncEventHandler):
         super().__init__(*args, **kwargs)
         self.settings = settings
         self.voices = voices
+        # Streaming-synthesis state. HA 2025.10+ sends synthesize-start,
+        # one or more synthesize-chunk, then synthesize-stop instead of a
+        # single legacy `synthesize` event when supports_synthesize_streaming
+        # is advertised. We buffer chunks here and flush on stop.
+        self._stream_voice: str | None = None
+        self._stream_buf: list[str] = []
+
+    def _pick_voice(self, requested) -> str | None:
+        if requested is not None and getattr(requested, "name", None):
+            return requested.name
+        return self.voices[0].name if self.voices else None
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -268,27 +285,71 @@ class IndexTTSHandler(AsyncEventHandler):
                 installed=True,
                 voices=self.voices,
                 version=None,
+                supports_synthesize_streaming=True,
             )])
             await self.write_event(info.event())
             return True
 
+        # Legacy single-shot path (HA < 2025.10 or any client not using streaming).
+        # HA 2026.x dispatches both the streaming sequence and a redundant legacy
+        # Synthesize for the same utterance — if we're mid-stream, skip this one
+        # to avoid running inference twice.
         if Synthesize.is_type(event.type):
+            if self._stream_voice is not None:
+                LOG.info("[bridge] ignoring legacy Synthesize (streaming session active)")
+                return True
             synth = Synthesize.from_event(event)
-            voice_name = (
-                synth.voice.name
-                if synth.voice and synth.voice.name
-                else (self.voices[0].name if self.voices else None)
-            )
+            voice_name = self._pick_voice(synth.voice)
             if voice_name is None:
                 LOG.error("Synthesize requested but no voices configured")
                 return True
-
             try:
                 await self._synthesize(synth.text, voice_name)
             except Exception:
                 LOG.exception("Synthesize failed")
             return True
 
+        # Streaming path: synthesize-start / -chunk / -stop.
+        if SynthesizeStart.is_type(event.type):
+            start = SynthesizeStart.from_event(event)
+            self._stream_voice = self._pick_voice(start.voice)
+            self._stream_buf = []
+            LOG.info("[STREAM] synthesize-start  voice=%s", self._stream_voice)
+            return True
+
+        if SynthesizeChunk.is_type(event.type):
+            chunk = SynthesizeChunk.from_event(event)
+            self._stream_buf.append(chunk.text)
+            LOG.info("[STREAM] synthesize-chunk  text=%r  total_chunks=%d",
+                     chunk.text[:60], len(self._stream_buf))
+            return True
+
+        if SynthesizeStop.is_type(event.type):
+            voice_name = self._stream_voice
+            text = "".join(self._stream_buf)
+            self._stream_voice = None
+            self._stream_buf = []
+            LOG.info("[STREAM] synthesize-stop  voice=%s  text_len=%d  text=%r",
+                     voice_name, len(text), text[:80])
+            if not text:
+                LOG.warning("synthesize-stop received with empty text buffer")
+                await self.write_event(SynthesizeStopped().event())
+                return True
+            if voice_name is None:
+                LOG.error("synthesize-stop with no voice configured")
+                await self.write_event(SynthesizeStopped().event())
+                return True
+            try:
+                await self._synthesize(text, voice_name)
+            except Exception:
+                LOG.exception("Streaming synthesize failed")
+            await self.write_event(SynthesizeStopped().event())
+            LOG.info("[STREAM] sent SynthesizeStopped")
+            return True
+
+        # Unknown event — log it so we can see if HA is sending something we
+        # don't yet handle.
+        LOG.debug("[bridge] unhandled event type=%s", event.type)
         return True
 
     async def _synthesize(self, text: str, voice_name: str) -> None:

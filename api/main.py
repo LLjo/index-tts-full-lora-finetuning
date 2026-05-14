@@ -318,7 +318,7 @@ async def load_model(speaker_name: str):
                 use_fp16=torch.cuda.is_available(),
                 use_cuda_kernel=torch.cuda.is_available(),
                 use_accel=True,
-                use_deepspeed=True,
+                use_deepspeed=os.environ.get("INDEXTTS_USE_DEEPSPEED", "false").lower() == "true",
                 use_torch_compile=True,
                 s2mel_distilled_checkpoint=distilled_ckpt,
             )
