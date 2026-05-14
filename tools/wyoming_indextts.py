@@ -59,6 +59,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -77,6 +78,52 @@ from wyoming.tts import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+# Boundary = sentence terminator + whitespace, OR a paragraph break.
+# Negative lookbehind on digits prevents splitting numbered lists ("1. Foo").
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<![0-9])[.!?]+(?=\s)|\n{2,}')
+# Sentences shorter than this aren't worth a separate TTS roundtrip; they get
+# fused with the next one. Keeps "Sure!" + "Here's a recipe..." as one call.
+_MIN_SENTENCE_CHARS = 30
+
+
+class _SentenceStream:
+    """Incremental sentence extractor for streaming LLM output.
+
+    Feed text chunks via `feed()`; it returns any complete sentences that have
+    accumulated since the last call. Call `flush()` at end-of-stream to get
+    whatever's still buffered."""
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._search_from = 0  # next regex search starts here (skips rejected boundaries)
+
+    def feed(self, text: str) -> list[str]:
+        self._buf += text
+        out: list[str] = []
+        while True:
+            m = _SENTENCE_BOUNDARY_RE.search(self._buf, self._search_from)
+            if not m:
+                break
+            cut = m.end()
+            sentence = self._buf[:cut].strip()
+            if len(sentence) >= _MIN_SENTENCE_CHARS:
+                out.append(sentence)
+                self._buf = self._buf[cut:].lstrip()
+                self._search_from = 0
+            else:
+                # Too short — advance past this boundary so we keep accumulating,
+                # but leave the buffer's actual chars (incl. the terminator)
+                # intact for when we eventually emit.
+                self._search_from = cut
+        return out
+
+    def flush(self) -> str | None:
+        remaining = self._buf.strip()
+        self._buf = ""
+        self._search_from = 0
+        return remaining if remaining else None
 
 LOG = logging.getLogger("wyoming-indextts")
 
@@ -264,9 +311,14 @@ class IndexTTSHandler(AsyncEventHandler):
         # Streaming-synthesis state. HA 2025.10+ sends synthesize-start,
         # one or more synthesize-chunk, then synthesize-stop instead of a
         # single legacy `synthesize` event when supports_synthesize_streaming
-        # is advertised. We buffer chunks here and flush on stop.
+        # is advertised. We split incoming text into sentences and start TTS
+        # as soon as each sentence completes, so playback can begin while the
+        # LLM is still streaming.
         self._stream_voice: str | None = None
-        self._stream_buf: list[str] = []
+        self._stream_sentences: _SentenceStream | None = None
+        # Whether we've already emitted an AudioStart for the current
+        # streaming session. Subsequent sentence syntheses skip it.
+        self._stream_audio_started: bool = False
 
     def _pick_voice(self, requested) -> str | None:
         if requested is not None and getattr(requested, "name", None):
@@ -310,39 +362,63 @@ class IndexTTSHandler(AsyncEventHandler):
             return True
 
         # Streaming path: synthesize-start / -chunk / -stop.
+        # Strategy: extract sentences from incoming chunks and start
+        # synthesizing each as soon as it completes. AudioStart fires once
+        # on the first sentence; AudioStop once at stream end.
         if SynthesizeStart.is_type(event.type):
             start = SynthesizeStart.from_event(event)
             self._stream_voice = self._pick_voice(start.voice)
-            self._stream_buf = []
+            self._stream_sentences = _SentenceStream()
+            self._stream_audio_started = False
             LOG.info("[STREAM] synthesize-start  voice=%s", self._stream_voice)
             return True
 
         if SynthesizeChunk.is_type(event.type):
             chunk = SynthesizeChunk.from_event(event)
-            self._stream_buf.append(chunk.text)
-            LOG.info("[STREAM] synthesize-chunk  text=%r  total_chunks=%d",
-                     chunk.text[:60], len(self._stream_buf))
+            if self._stream_sentences is None or self._stream_voice is None:
+                LOG.warning("synthesize-chunk received outside a streaming session")
+                return True
+            sentences = self._stream_sentences.feed(chunk.text)
+            for sentence in sentences:
+                LOG.info("[STREAM] synthesizing sentence  text=%r", sentence[:80])
+                try:
+                    await self._synthesize(
+                        sentence,
+                        self._stream_voice,
+                        manage_audio_session=False,
+                    )
+                except Exception:
+                    LOG.exception("Sentence synthesize failed")
             return True
 
         if SynthesizeStop.is_type(event.type):
             voice_name = self._stream_voice
-            text = "".join(self._stream_buf)
+            sentences = self._stream_sentences
+            audio_started = self._stream_audio_started
             self._stream_voice = None
-            self._stream_buf = []
-            LOG.info("[STREAM] synthesize-stop  voice=%s  text_len=%d  text=%r",
-                     voice_name, len(text), text[:80])
-            if not text:
-                LOG.warning("synthesize-stop received with empty text buffer")
-                await self.write_event(SynthesizeStopped().event())
-                return True
-            if voice_name is None:
-                LOG.error("synthesize-stop with no voice configured")
-                await self.write_event(SynthesizeStopped().event())
-                return True
-            try:
-                await self._synthesize(text, voice_name)
-            except Exception:
-                LOG.exception("Streaming synthesize failed")
+            self._stream_sentences = None
+            self._stream_audio_started = False
+
+            remaining = sentences.flush() if sentences else None
+            LOG.info("[STREAM] synthesize-stop  voice=%s  trailing=%r",
+                     voice_name, (remaining or "")[:80])
+
+            if remaining and voice_name is not None:
+                try:
+                    await self._synthesize(
+                        remaining,
+                        voice_name,
+                        manage_audio_session=False,
+                    )
+                    audio_started = audio_started or self._stream_audio_started
+                except Exception:
+                    LOG.exception("Final sentence synthesize failed")
+
+            # Close the audio session if we ever opened it. If we never
+            # synthesized anything (empty stream), we still send Stopped so
+            # HA doesn't hang.
+            if audio_started:
+                await self.write_event(AudioStop().event())
             await self.write_event(SynthesizeStopped().event())
             LOG.info("[STREAM] sent SynthesizeStopped")
             return True
@@ -352,7 +428,20 @@ class IndexTTSHandler(AsyncEventHandler):
         LOG.debug("[bridge] unhandled event type=%s", event.type)
         return True
 
-    async def _synthesize(self, text: str, voice_name: str) -> None:
+    async def _synthesize(
+        self,
+        text: str,
+        voice_name: str,
+        manage_audio_session: bool = True,
+    ) -> None:
+        """Synthesize `text` with `voice_name` and stream audio out.
+
+        When manage_audio_session is True (legacy/standalone path), emits
+        AudioStart before the first chunk and AudioStop in finally. When
+        False (sentence-streaming path), the caller owns AudioStart/Stop
+        bookkeeping across multiple sentences; we just emit AudioChunks
+        and set `_stream_audio_started=True` on the first chunk so the
+        caller knows we opened the session."""
         api_url = self.settings["api_url"]
         # 1. Swap LoRA if needed (cached — usually a no-op on repeated calls)
         await _ensure_voice_loaded(api_url, voice_name)
@@ -378,9 +467,10 @@ class IndexTTSHandler(AsyncEventHandler):
         LOG.info("Synthesize  voice=%s  ref=%s  text=%r",
                  voice_name, ref_path.name if ref_path else "<embeddings>", text[:80])
 
-        await self.write_event(AudioStart(
-            rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
-        ).event())
+        if manage_audio_session:
+            await self.write_event(AudioStart(
+                rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
+            ).event())
 
         try:
             async with client.stream(
@@ -410,6 +500,12 @@ class IndexTTSHandler(AsyncEventHandler):
                         i = 0
                         while i < n_full:
                             piece = buf[i : i + WYOMING_CHUNK_BYTES]
+                            if not manage_audio_session and not self._stream_audio_started:
+                                # First audio of a streaming session — open it now.
+                                await self.write_event(AudioStart(
+                                    rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
+                                ).event())
+                                self._stream_audio_started = True
                             await self.write_event(AudioChunk(
                                 rate=SAMPLE_RATE,
                                 width=SAMPLE_WIDTH,
@@ -426,7 +522,8 @@ class IndexTTSHandler(AsyncEventHandler):
             if ref_fh is not None:
                 try: ref_fh.close()
                 except Exception: pass
-            await self.write_event(AudioStop().event())
+            if manage_audio_session:
+                await self.write_event(AudioStop().event())
 
 
 async def main() -> int:
