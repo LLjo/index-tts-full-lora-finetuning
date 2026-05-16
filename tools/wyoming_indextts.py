@@ -39,8 +39,15 @@ Env vars:
                                    continuity via /inference/stream's session
                                    API; see docs/SESSION_CONTINUITY_PLAN.md)
   INDEXTTS_WYOMING_TAIL_S         (optional float; overrides server default
-                                   for how many seconds of the previous
-                                   sentence to retain as the style prompt)
+                                   for how many seconds of mel-prefix to
+                                   retain as the next-call's continuation
+                                   context)
+  INDEXTTS_WYOMING_SPLIT          (default: sentence — splits streaming LLM
+                                   output on . ! ? and paragraph breaks.
+                                   Set to "phrase" to also split on , ; : —
+                                   reduces TTFA on long run-on sentences,
+                                   relies on session continuity to keep
+                                   prosody flowing across smaller chunks)
 
 Reference-audio resolution chain (per synthesize call):
   1. If INDEXTTS_REFERENCE_AUDIO is set, upload that file. The API caches
@@ -87,43 +94,63 @@ from wyoming.tts import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-# Boundary = sentence terminator + whitespace, OR a paragraph break.
+# Sentence boundary = sentence terminator + whitespace, OR a paragraph break.
 # Negative lookbehind on digits prevents splitting numbered lists ("1. Foo").
 _SENTENCE_BOUNDARY_RE = re.compile(r'(?<![0-9])[.!?]+(?=\s)|\n{2,}')
+# Phrase boundary = also splits on commas, semicolons, and colons. Used when
+# INDEXTTS_WYOMING_SPLIT=phrase. Faster TTFA on long run-on LLM sentences at
+# the cost of smaller per-call chunks (more inter-call overhead, more session
+# prefix re-injection, but each one is still well-aligned).
+_PHRASE_BOUNDARY_RE = re.compile(r'(?<![0-9])[.!?,;:]+(?=\s)|\n{2,}')
+
 # Sentences shorter than this get fused with the next one. Smaller = faster
 # time-to-first-audio; larger = better intra-sentence prosody. We use a very
-# small threshold for the FIRST sentence (so e.g. "Sure!" emits immediately
-# and the user hears something fast) and a larger one for subsequent sentences
+# small threshold for the FIRST chunk (so e.g. "Sure!" emits immediately
+# and the user hears something fast) and a larger one for subsequent chunks
 # (so body prose doesn't get chopped into awkward fragments).
 _FIRST_SENTENCE_MIN_CHARS = 5
 _SUBSEQUENT_SENTENCE_MIN_CHARS = 30
+# Phrase mode uses a smaller "subsequent" threshold so phrases aren't fused
+# back into full sentences. Sub-15-char phrases still get fused (e.g. "Yes,"
+# alone is too small to be its own synth call — wait for the next clause).
+_PHRASE_SUBSEQUENT_MIN_CHARS = 15
 
 
 class _SentenceStream:
-    """Incremental sentence extractor for streaming LLM output.
+    """Incremental chunk extractor for streaming LLM output.
 
-    Feed text chunks via `feed()`; it returns any complete sentences that have
+    Cuts on sentence boundaries (default) or phrase boundaries (mode='phrase').
+    Feed text chunks via `feed()`; it returns any complete chunks that have
     accumulated since the last call. Call `flush()` at end-of-stream to get
-    whatever's still buffered."""
+    whatever's still buffered.
+    """
 
-    def __init__(self) -> None:
+    def __init__(self, mode: str = "sentence") -> None:
         self._buf = ""
         self._search_from = 0  # next regex search starts here (skips rejected boundaries)
-        self._emitted = 0  # how many sentences we've returned in this session
+        self._emitted = 0  # how many chunks we've returned in this session
+        if mode == "phrase":
+            self._re = _PHRASE_BOUNDARY_RE
+            self._first_min_chars = _FIRST_SENTENCE_MIN_CHARS
+            self._subsequent_min_chars = _PHRASE_SUBSEQUENT_MIN_CHARS
+        else:
+            self._re = _SENTENCE_BOUNDARY_RE
+            self._first_min_chars = _FIRST_SENTENCE_MIN_CHARS
+            self._subsequent_min_chars = _SUBSEQUENT_SENTENCE_MIN_CHARS
 
     def feed(self, text: str) -> list[str]:
         self._buf += text
         out: list[str] = []
         while True:
-            m = _SENTENCE_BOUNDARY_RE.search(self._buf, self._search_from)
+            m = self._re.search(self._buf, self._search_from)
             if not m:
                 break
             cut = m.end()
-            sentence = self._buf[:cut].strip()
-            min_chars = (_FIRST_SENTENCE_MIN_CHARS if self._emitted == 0
-                         else _SUBSEQUENT_SENTENCE_MIN_CHARS)
-            if len(sentence) >= min_chars:
-                out.append(sentence)
+            chunk = self._buf[:cut].strip()
+            min_chars = (self._first_min_chars if self._emitted == 0
+                         else self._subsequent_min_chars)
+            if len(chunk) >= min_chars:
+                out.append(chunk)
                 self._emitted += 1
                 self._buf = self._buf[cut:].lstrip()
                 self._search_from = 0
@@ -180,6 +207,12 @@ def _settings() -> dict:
         # sentence sends session_reset=true to wipe any stale state.
         "use_session": _envb("INDEXTTS_WYOMING_USE_SESSION", True),
         "session_tail_seconds": _opt_float(os.environ.get("INDEXTTS_WYOMING_TAIL_S")),
+        # How to chunk incoming streaming text.
+        #   sentence — cut on . ! ? and paragraph breaks (default, safest).
+        #   phrase   — also cut on , ; : — faster TTFA on long LLM sentences,
+        #              relies on session continuity to keep prosody flowing
+        #              across the smaller per-call chunks.
+        "split_mode": (os.environ.get("INDEXTTS_WYOMING_SPLIT", "sentence") or "sentence").lower(),
     }
 
 
@@ -489,7 +522,9 @@ class IndexTTSHandler(AsyncEventHandler):
         if SynthesizeStart.is_type(event.type):
             start = SynthesizeStart.from_event(event)
             self._stream_voice = self._pick_voice(start.voice)
-            self._stream_sentences = _SentenceStream()
+            self._stream_sentences = _SentenceStream(
+                mode=self.settings.get("split_mode", "sentence"),
+            )
             self._stream_pipeline_q = asyncio.Queue()
             self._stream_writer_task = asyncio.create_task(
                 self._stream_writer(self._stream_pipeline_q)
