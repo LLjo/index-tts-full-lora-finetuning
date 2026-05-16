@@ -48,7 +48,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Generator, Union, List
+from typing import Optional, Generator, Union, List, Callable
 import os
 
 import torch
@@ -391,6 +391,12 @@ def pattern_aware_inference_streaming(
     config: Optional['StreamingConfigV2'] = None,
     timing_log: Optional[list] = None,
     cond_cache_key: Optional[str] = None,
+    # Cross-call mel-prefix continuity (see api/sessions.py). prefix_codes and
+    # prefix_text MUST be passed together — the GPT needs the text that those
+    # codes correspond to in order to align them against the new request text.
+    prefix_codes: Optional['torch.Tensor'] = None,
+    prefix_text: Optional[str] = None,
+    on_codes_complete: Optional[Callable[['torch.Tensor'], None]] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     True streaming inference with pattern embedding injection.
@@ -464,6 +470,9 @@ def pattern_aware_inference_streaming(
         max_mel_tokens=max_mel_tokens,
         timing_log=timing_log,
         cond_cache_key=cond_cache_key,
+        prefix_codes=prefix_codes,
+        prefix_text=prefix_text,
+        on_codes_complete=on_codes_complete,
     )
 
 

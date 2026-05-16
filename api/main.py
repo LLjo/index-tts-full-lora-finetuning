@@ -27,6 +27,8 @@ import torch
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import numpy as np
+
 from indextts.infer_v2 import IndexTTS2
 from indextts.pattern_embeddings import PatternEmbedding
 from indextts.streaming_v2 import (
@@ -43,6 +45,7 @@ from indextts.streaming_v2 import (
     get_progressive_streaming_config,
 )
 from tools.infer_with_patterns import pattern_aware_inference, pattern_aware_inference_streaming
+from api import sessions as _sess
 
 # Global state
 app = FastAPI(
@@ -112,6 +115,19 @@ class TTSRequest(BaseModel):
     emo_text: Optional[str] = Field(None, description="Custom emotion text")
     use_fp16: bool = Field(False, description="Use FP16 precision")
     use_torch_compile: bool = Field(False, description="Use torch.compile optimization")
+    # Session continuity (see docs/SESSION_CONTINUITY_PLAN.md). Opaque ID — if
+    # set, the tail of the previous synthesis under this ID is used as the
+    # style/emotion prompt so prosody carries across calls. Tail is captured
+    # AFTER synthesis regardless of whether explicit emo overrides won this
+    # call, so dropping the override on a later call still has carry-over.
+    session_id: Optional[str] = Field(None, description="Opaque session id for cross-call prosody continuity")
+    session_tail_seconds: float = Field(
+        _sess.SESSION_DEFAULT_TAIL_S,
+        ge=_sess.SESSION_TAIL_MIN_S,
+        le=_sess.SESSION_TAIL_MAX_S,
+        description="Seconds of previous output retained as style prompt",
+    )
+    session_reset: bool = Field(False, description="Drop any stored tail under session_id before generating")
 
 
 class StreamTTSRequest(BaseModel):
@@ -143,6 +159,16 @@ class StreamTTSRequest(BaseModel):
     solver_override: Optional[str] = Field(None, description="If set, replaces the preset's solver. One of: euler, heun, single_step.")
     diffusion_steps_override: Optional[int] = Field(None, ge=1, le=50, description="If set, replaces the preset's diffusion_steps AND first_chunk_diffusion_steps (use 1 for distilled student).")
     inference_cfg_override: Optional[float] = Field(None, ge=0.0, le=2.0, description="If set, replaces the preset's CFG rate (use 0.0 for distilled student).")
+    # Session continuity (see docs/SESSION_CONTINUITY_PLAN.md). Identical to
+    # the fields on TTSRequest — Wyoming bridge sets these per HA utterance.
+    session_id: Optional[str] = Field(None, description="Opaque session id for cross-call prosody continuity")
+    session_tail_seconds: float = Field(
+        _sess.SESSION_DEFAULT_TAIL_S,
+        ge=_sess.SESSION_TAIL_MIN_S,
+        le=_sess.SESSION_TAIL_MAX_S,
+        description="Seconds of previous output retained as style prompt",
+    )
+    session_reset: bool = Field(False, description="Drop any stored tail under session_id before generating")
 
 
 class TrainingRequest(BaseModel):
@@ -189,11 +215,17 @@ async def startup_event():
     print("💡 Model not loaded automatically - use the WebUI or API to load models")
     tts_model = None
 
+    # Per-session rolling-context store (see docs/SESSION_CONTINUITY_PLAN.md).
+    # The sweeper drops idle sessions after INDEXTTS_SESSION_TTL_S.
+    if _sess.SESSION_ENABLED:
+        _sess.start_sweeper()
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
     global tts_model
+    _sess.stop_sweeper()
     if tts_model is not None:
         del tts_model
         torch.cuda.empty_cache()
@@ -237,6 +269,39 @@ async def health_check():
         "device": str(tts_model.device) if tts_model else None,
         "cuda_available": torch.cuda.is_available()
     }
+
+
+# ============= Session continuity (see docs/SESSION_CONTINUITY_PLAN.md) =============
+
+
+@app.get("/sessions")
+async def list_sessions():
+    """Debug: list active prosody-continuity sessions."""
+    return {
+        "enabled": _sess.SESSION_ENABLED,
+        "mechanism": "mel_prefix",
+        "ttl_s": _sess.SESSION_TTL_S,
+        "max_count": _sess.SESSION_MAX_COUNT,
+        "default_tail_s": _sess.SESSION_DEFAULT_TAIL_S,
+        "tail_max_s": _sess.SESSION_TAIL_MAX_S,
+        "prefix_tokens_default": _sess.SESSION_PREFIX_TOKENS,
+        "prefix_tokens_max": _sess.SESSION_PREFIX_TOKENS_MAX,
+        "sessions": _sess.list_sessions(),
+    }
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Drop a session's stored tail. Idempotent — returns existed=False if it
+    wasn't there. Called by the Wyoming bridge on synthesize-stop."""
+    return {"session_id": session_id, "existed": _sess.delete_session(session_id)}
+
+
+@app.post("/sessions/{session_id}/reset")
+async def reset_session(session_id: str):
+    """Same as DELETE — kept for symmetry with the `session_reset=true` flag
+    in StreamTTSRequest so callers can pick whichever feels more natural."""
+    return {"session_id": session_id, "existed": _sess.delete_session(session_id)}
 
 
 # ============= Model Management =============
@@ -381,13 +446,20 @@ async def generate_speech(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_audio:
             shutil.copyfileobj(audio_file.file, tmp_audio)
             tmp_audio_path = tmp_audio.name
-    
+
+    # Session continuity isn't wired through the non-streaming infer() path
+    # yet — only honor session_reset so callers can flush a leftover session
+    # before kicking off a fresh streaming utterance. The /inference/stream
+    # endpoint is where session_id is actually consumed.
+    if request.session_id and request.session_reset:
+        _sess.delete_session(request.session_id)
+
     try:
         # Prepare output path
         output_dir = PROJECT_ROOT / "outputs" / "api"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"tts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-        
+
         # Generate speech
         if request.use_patterns and request.speaker:
             # Use pattern-aware inference
@@ -401,7 +473,7 @@ async def generate_speech(
                 top_k=request.top_k,
                 emo_vector=request.emo_vector,
                 use_emo_text=request.use_emo_text,
-                emo_text=request.emo_text
+                emo_text=request.emo_text,
             )
         else:
             # Standard inference
@@ -414,16 +486,16 @@ async def generate_speech(
                 top_k=request.top_k,
                 emo_vector=request.emo_vector,
                 use_emo_text=request.use_emo_text,
-                emo_text=request.emo_text
+                emo_text=request.emo_text,
             )
-        
+
         # Return generated audio file
         return FileResponse(
             output_path,
             media_type="audio/wav",
             filename=f"generated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         )
-    
+
     finally:
         # Cleanup temp file
         if tmp_audio_path is not None:
@@ -521,13 +593,51 @@ async def stream_speech(
     async def generate_chunks():
         """
         OPTIMIZED streaming generator using the new streaming module.
-        
+
         Achieves ~0.3s time-to-first-audio by synthesizing chunks during
         GPT token generation.
         """
         import io
         import wave
-        
+
+        # ── Session-continuity setup (see docs/SESSION_CONTINUITY_PLAN.md) ──
+        # Mel-token prefix mechanism: load the trailing slice of the previous
+        # call's GPT output, hand it to streaming_v2 as `prefix_codes` so the
+        # autoregressive decode continues from that prosodic state. The
+        # speaker reference and emotion paths stay untouched, so no
+        # synthesized audio ever loops back into the conditioning extractors
+        # — no photocopy-of-photocopy drift.
+        session_id = request.session_id or None
+        if session_id and request.session_reset:
+            _sess.delete_session(session_id)
+        prior_session = _sess.get_session_prefix(session_id) if session_id else None
+        prefix_codes = prior_session.prefix_codes if prior_session is not None else None
+        prefix_text = prior_session.prefix_text if prior_session is not None else None
+
+        # Capacity for this call's stored prefix. The Pydantic field is in
+        # seconds for backwards-compat; ~50 mel tokens/s for IndexTTS2.
+        prefix_token_cap = max(
+            _sess.SESSION_PREFIX_TOKENS_MIN,
+            min(
+                _sess.SESSION_PREFIX_TOKENS_MAX,
+                int(round(request.session_tail_seconds * 50.0)),
+            ),
+        )
+
+        # Snapshot the current request text so the on-codes callback can store
+        # it as the next call's prefix_text. Using the user-provided text
+        # (NOT any concat we did internally) — that's what the codes we get
+        # back correspond to, because streaming_v2 strips the prefix from
+        # output before invoking the callback.
+        current_text = request.text
+
+        def _persist_codes(codes_tensor):
+            if session_id:
+                _sess.store_session_prefix(
+                    session_id, codes_tensor, current_text,
+                    max_tokens=prefix_token_cap,
+                )
+
         try:
             # Load speaker embeddings and pattern embedding if using patterns
             speaker_embeddings = None
@@ -574,6 +684,13 @@ async def stream_speech(
             chunk_idx = 0
             header_sent = False
 
+            # spk_audio_prompt stays as the ORIGINAL upload — no concat with
+            # synthesized audio (that was the drift-prone approach this
+            # mechanism replaces). cond_cache_key stays valid: the audio
+            # context is unchanged across calls, only the GPT's input_ids
+            # change. The prefix codes flow into the GPT via streaming_v2's
+            # `prefix_codes` arg, which forces the non-accel HF generate
+            # path for this call.
             for wav_chunk in pattern_aware_inference_streaming(
                 tts=tts_model,
                 text=request.text,
@@ -589,14 +706,18 @@ async def stream_speech(
                 top_p=request.top_p,
                 top_k=request.top_k,
                 cond_cache_key=cond_cache_key,
+                prefix_codes=prefix_codes,
+                prefix_text=prefix_text,
+                on_codes_complete=_persist_codes,
             ):
                 # Ensure chunk has correct shape
                 if wav_chunk.dim() == 1:
                     wav_chunk = wav_chunk.unsqueeze(0)
-                
+
                 # Convert to int16 bytes
                 chunk_int16 = wav_chunk.type(torch.int16)
-                
+                chunk_np = chunk_int16.cpu().numpy()
+
                 # Send WAV header with first chunk (unless raw_pcm — Wyoming bridge
                 # wants raw int16 LE with no header).
                 if not raw_pcm and not header_sent:
@@ -613,10 +734,12 @@ async def stream_speech(
                     header_sent = True
 
                 # Stream raw PCM data
-                yield chunk_int16.cpu().numpy().tobytes()
+                yield chunk_np.tobytes()
                 chunk_idx += 1
-        
+
         finally:
+            # The mel-code prefix gets persisted by the on_codes_complete
+            # callback inside streaming_v2 — no extra work needed here.
             # Cleanup temp file
             if tmp_audio_path is not None:
                 try:

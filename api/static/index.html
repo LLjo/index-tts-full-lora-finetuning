@@ -202,6 +202,28 @@
                         </select>
                     </div>
 
+                    <div class="form-group">
+                        <label for="streamingSplitMode">Stream-split mode (used by "Stream Speech")</label>
+                        <select id="streamingSplitMode">
+                            <option value="phrase" selected>Phrase — split on commas / sentence terminators (recommended for long sentences)</option>
+                            <option value="sentence">Sentence — one request per sentence (mimics Wyoming/HA)</option>
+                            <option value="words">Word count — split every N words (continuity stress test)</option>
+                            <option value="none">Off — send whole text in one request</option>
+                        </select>
+                        <div id="streamingWordsPerChunkGroup" style="display:none; margin-top:8px;">
+                            <label for="streamingWordsPerChunk">
+                                Words per request:
+                                <span id="streamingWordsPerChunkValue">8</span>
+                            </label>
+                            <input type="range" id="streamingWordsPerChunk" min="2" max="30" value="8" style="width:100%;">
+                        </div>
+                        <small style="color:#636e72;">
+                            Multi-chunk modes reuse a single <code>session_id</code> so the API carries
+                            prosody/emotion across requests (see docs/SESSION_CONTINUITY_PLAN.md).
+                            Explicit emotion vector / text wins over the session tail.
+                        </small>
+                    </div>
+
                     <!-- Solver/steps overrides — useful when a distilled student is active. -->
                     <details class="advanced-options">
                         <summary>CFM solver overrides (Phase 3)</summary>

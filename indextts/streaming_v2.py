@@ -768,6 +768,20 @@ def streaming_inference_v2(
     # speaker embedding file path here so repeated requests for the same speaker
     # skip the conditioning encoder forward.
     cond_cache_key: Optional[str] = None,
+    # Mel-token prefix for cross-call prosody continuity (see api/sessions.py).
+    # When provided, these tokens are appended to the GPT's input_ids as if
+    # they had already been generated, so the autoregressive decode continues
+    # from that prosodic state. MUST be paired with `prefix_text` — the text
+    # those codes correspond to. Without that, the GPT misinterprets the codes
+    # as covering the start of the CURRENT text and skips the first words.
+    # The presence of a prefix forces the non-accel generate path (CUDA graphs
+    # can't recapture per-call), ~100-150 ms TTFA cost.
+    prefix_codes: Optional[torch.Tensor] = None,
+    prefix_text: Optional[str] = None,
+    # Callback invoked once with the full generated mel-code tensor (1-D
+    # long, on CPU) when GPT generation completes. The API uses this to
+    # persist the trailing slice as the next call's prefix.
+    on_codes_complete: Optional[Callable[[torch.Tensor], None]] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     High-quality streaming TTS inference.
@@ -990,6 +1004,9 @@ def streaming_inference_v2(
             top_k=top_k,
             max_mel_tokens=max_mel_tokens,
             on_audio_chunk=on_audio_chunk,
+            prefix_codes=prefix_codes,
+            prefix_text=prefix_text,
+            on_codes_complete=on_codes_complete,
         )
     else:
         # FAST_CHUNKS, PROGRESSIVE_CONTEXT, OVERLAP_SYNTHESIS
@@ -1011,6 +1028,9 @@ def streaming_inference_v2(
             on_audio_chunk=on_audio_chunk,
             log_event=log_event,
             stream_start_anchor=start_time,
+            prefix_codes=prefix_codes,
+            prefix_text=prefix_text,
+            on_codes_complete=on_codes_complete,
         )
 
 
@@ -1029,6 +1049,14 @@ def _stream_by_sentences(
     top_k: int,
     max_mel_tokens: int,
     on_audio_chunk: Optional[Callable],
+    # Mel-prefix continuation: in sentence-level mode the prefix is injected
+    # only into the FIRST segment so the rest of the user's text generates
+    # fresh (the previous call's tail anchors the start, then prosody flows
+    # forward naturally). MUST be paired with prefix_text. on_codes_complete
+    # fires once with the concatenation of all segments' codes at end-of-call.
+    prefix_codes: Optional[torch.Tensor] = None,
+    prefix_text: Optional[str] = None,
+    on_codes_complete: Optional[Callable[[torch.Tensor], None]] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     Stream by sentence boundaries - best quality mode.
@@ -1064,39 +1092,67 @@ def _stream_by_sentences(
     
     first_audio_time = None
     start_time = time.perf_counter()
-    
+    all_call_codes: List[int] = []  # accumulates across segments for on_codes_complete
+
+    use_prefix_seg = (
+        prefix_codes is not None
+        and prefix_codes.numel() > 0
+        and prefix_text is not None
+        and prefix_text.strip() != ""
+    )
+
     for seg_idx, segment in enumerate(segments):
         is_first = seg_idx == 0
         is_final = seg_idx == len(segments) - 1
-        
+
         seg_start = time.perf_counter()
-        
-        # Tokenize segment
-        text_tokens_list = tts.tokenizer.tokenize(segment)
+
+        # Tokenize segment. On the FIRST segment with a mel-prefix in play,
+        # prepend the aligning prefix_text so the GPT can match codes to
+        # the text they came from. Subsequent segments tokenize cleanly.
+        seg_text = (
+            f"{prefix_text.strip()} {segment.strip()}"
+            if is_first and use_prefix_seg
+            else segment
+        )
+        text_tokens_list = tts.tokenizer.tokenize(seg_text)
         text_token_ids = tts.tokenizer.convert_tokens_to_ids(text_tokens_list)
         text_tokens = torch.tensor(text_token_ids, dtype=torch.long, device=device).unsqueeze(0)
-        
+
         if config.verbose:
-            print(f"  [Segment {seg_idx+1}] {len(text_tokens_list)} text tokens")
-        
+            print(f"  [Segment {seg_idx+1}] {len(text_tokens_list)} text tokens"
+                  + (" (prefix_text prepended)" if is_first and use_prefix_seg else ""))
+
         # Prepare GPT inputs
         batch_size = 1
         use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
         duration_ctrl = tts.gpt.speed_emb(torch.ones_like(use_speed))
         duration_free = tts.gpt.speed_emb(torch.zeros_like(use_speed))
-        
+
         emo_vec_expanded = emo_vec.unsqueeze(1) if emo_vec.dim() == 2 else emo_vec
-        
+
         conds_latent = torch.cat(
             (final_conditioning + emo_vec_expanded,
              duration_ctrl.unsqueeze(1),
              duration_free.unsqueeze(1)),
             dim=1,
         )
-        
+
         input_ids, inputs_embeds, attention_mask = tts.gpt.prepare_gpt_inputs(conds_latent, text_tokens)
         tts.gpt.inference_model.store_mel_emb(inputs_embeds)
-        
+
+        # Inject the cross-call mel prefix ONLY on the first segment of this
+        # call. Subsequent segments flow from the first one's prosodic state
+        # naturally and don't need (or want) the same prefix reapplied.
+        if is_first and use_prefix_seg:
+            prefix_1d = prefix_codes.to(device=device, dtype=input_ids.dtype).reshape(-1)
+            if config.verbose:
+                print(f"  [SentenceLevel] mel-prefix: {prefix_1d.numel()} tokens injected")
+            input_ids = torch.cat([input_ids, prefix_1d.unsqueeze(0)], dim=1)
+            attention_mask = torch.nn.functional.pad(
+                attention_mask, (0, prefix_1d.numel()), value=1
+            )
+
         # Generate mel tokens for this segment
         with torch.no_grad():
             with torch.amp.autocast(device.type, enabled=use_autocast, dtype=tts.dtype or torch.float32):
@@ -1113,7 +1169,7 @@ def _stream_by_sentences(
                     temperature=temperature,
                     num_return_sequences=1,
                 )
-        
+
         # Extract generated codes (skip input portion)
         trunc_index = input_ids.shape[1]
         codes = output[:, trunc_index:]
@@ -1134,7 +1190,11 @@ def _stream_by_sentences(
         valid_mask = (codes[0] != start_mel_token) & (codes[0] != stop_mel_token)
         codes = codes[:, valid_mask]
         code_lens = torch.tensor([codes.shape[1]], device=device)
-        
+
+        # Accumulate clean codes for the cross-call session prefix.
+        if on_codes_complete is not None and codes.numel() > 0:
+            all_call_codes.extend(codes[0].detach().cpu().tolist())
+
         if config.verbose:
             print(f"    Generated {codes.shape[1]} mel tokens")
         
@@ -1162,7 +1222,16 @@ def _stream_by_sentences(
             on_audio_chunk(wav)
         
         yield wav
-    
+
+    # Hand the concatenated mel-code sequence back so the API can persist
+    # the trailing slice as the next call's prefix.
+    if on_codes_complete is not None and all_call_codes:
+        try:
+            on_codes_complete(torch.tensor(all_call_codes, dtype=torch.long))
+        except Exception as e:
+            if config.verbose:
+                print(f"[SentenceLevel] on_codes_complete raised: {e}")
+
     if config.verbose:
         total_time = time.perf_counter() - start_time
         print(f"[SentenceLevel] Total time: {total_time:.3f}s")
@@ -1185,6 +1254,16 @@ def _stream_by_tokens(
     on_audio_chunk: Optional[Callable],
     log_event: Optional[Callable[..., None]] = None,
     stream_start_anchor: Optional[float] = None,
+    # Mel-token prefix injected into the GPT before generation. When set,
+    # forces the non-accel HF generate path because the accel engine's
+    # CUDA graphs assume a fixed prefix shape. MUST be paired with
+    # `prefix_text` — without it the GPT misaligns the codes against the
+    # current text and skips the first words.
+    prefix_codes: Optional[torch.Tensor] = None,
+    prefix_text: Optional[str] = None,
+    # Invoked once at end-of-generation with the full mel-code sequence
+    # (1-D long, CPU). Used by the API to persist the next-call prefix.
+    on_codes_complete: Optional[Callable[[torch.Tensor], None]] = None,
 ) -> Generator[torch.Tensor, None, None]:
     """
     TRUE token-level streaming - synthesize chunks AS tokens are generated.
@@ -1201,6 +1280,20 @@ def _stream_by_tokens(
     # Resolved up front so the streamer can decide whether to lag-by-1 dispatch (Quick
     # Win #3 only makes sense when the accel engine is actually populating hidden states).
     accel_engine = getattr(tts.gpt, "accel_engine", None)
+    # A mel-token prefix changes the input_ids length, which would invalidate every
+    # captured CUDA graph in the accel engine. Force the HF generate fallback for
+    # this call — costs ~100-150 ms TTFA but is the only correct option.
+    # Reject the prefix entirely if no aligning text was provided: feeding mel
+    # codes without text alignment causes the GPT to skip the first words of
+    # the new text.
+    use_prefix = (
+        prefix_codes is not None
+        and prefix_codes.numel() > 0
+        and prefix_text is not None
+        and prefix_text.strip() != ""
+    )
+    if use_prefix:
+        accel_engine = None
     use_hidden_state_reuse = (
         config.use_decoded_hidden_states and accel_engine is not None
     )
@@ -1210,13 +1303,25 @@ def _stream_by_tokens(
         def log_event(event, **extra):
             pass
 
-    # Tokenize full text
-    text_tokens_list = tts.tokenizer.tokenize(text)
+    # Tokenize full text. If a mel-prefix is in play, prepend the matching
+    # prefix_text so the GPT sees aligned state: codes for the early portion
+    # of the text it's about to speak, then continue with the new portion.
+    # Without this prepend, the GPT treats the codes as covering the first
+    # words of `text` and skips them.
+    if use_prefix:
+        gen_text = f"{prefix_text.strip()} {text.strip()}"
+    else:
+        gen_text = text
+    text_tokens_list = tts.tokenizer.tokenize(gen_text)
     text_token_ids = tts.tokenizer.convert_tokens_to_ids(text_tokens_list)
     text_tokens = torch.tensor(text_token_ids, dtype=torch.long, device=device).unsqueeze(0)
-    
+
     if config.verbose:
-        print(f"[TokenLevel] Text: {len(text_tokens_list)} tokens")
+        if use_prefix:
+            print(f"[TokenLevel] Text: {len(text_tokens_list)} tokens "
+                  f"(prefix_text={prefix_text!r:.60} + new)")
+        else:
+            print(f"[TokenLevel] Text: {len(text_tokens_list)} tokens")
     
     # Prepare GPT inputs
     batch_size = 1
@@ -1235,7 +1340,23 @@ def _stream_by_tokens(
     
     input_ids, inputs_embeds, attention_mask = tts.gpt.prepare_gpt_inputs(conds_latent, text_tokens)
     tts.gpt.inference_model.store_mel_emb(inputs_embeds)
-    
+
+    # If a session prefix is in play, append it to the GPT's input_ids so the
+    # autoregressive decode starts as though those mel tokens had already been
+    # generated. Same shape contract as inference_speech()'s `input_tokens`
+    # parameter — input_ids becomes [pad][cond][text][start_mel][prefix_codes],
+    # attention_mask grows to match. The streamer's prompt-swallow logic
+    # discards the initial 2-D batched put() that HF's generate emits, so
+    # these injected tokens aren't re-played.
+    if use_prefix:
+        prefix_1d = prefix_codes.to(device=device, dtype=input_ids.dtype).reshape(-1)
+        if config.verbose:
+            print(f"[TokenLevel] mel-prefix: {prefix_1d.numel()} tokens injected")
+        input_ids = torch.cat([input_ids, prefix_1d.unsqueeze(0)], dim=1)
+        attention_mask = torch.nn.functional.pad(
+            attention_mask, (0, prefix_1d.numel()), value=1
+        )
+
     # Create synthesizer
     synthesizer = EnhancedProgressiveSynthesizer(
         tts=tts,
@@ -1291,6 +1412,13 @@ def _stream_by_tokens(
             # dispatched chunk begins. Always equals (tokens already dispatched).
             # Used by Quick Win #3 to index accel_engine.last_decoded_hidden_states.
             self.dispatched_offset = 0
+            # HF generate calls streamer.put(input_ids) once with the full
+            # prompt (shape (batch, prompt_len)) before the decode loop. The
+            # accel engine doesn't — it only emits single sampled tokens.
+            # Swallow the first 2-D batched put regardless of whether a mel
+            # prefix is in play; without this, the prompt tokens would be
+            # mis-interpreted as generated mel codes on the non-accel path.
+            self._prompt_swallowed = False
 
         def put(self, value: torch.Tensor):
             """Called for each new token — buffer + queue a synth job at chunk thresholds.
@@ -1298,6 +1426,14 @@ def _stream_by_tokens(
             If `serialize_synth_with_gpt` is on, block here while a previous chunk is
             still synthesizing so GPT doesn't compete with CFM/BigVGAN for the GPU.
             """
+            if not self._prompt_swallowed:
+                self._prompt_swallowed = True
+                if value.dim() == 2:
+                    # This is the prompt batch — discard.
+                    return
+                # Single-token call here (accel engine path): fall through
+                # and process it normally. No prompt was ever sent.
+
             if config.serialize_synth_with_gpt:
                 gpt_can_proceed.wait()
             if not self.first_token_logged:
@@ -1379,6 +1515,21 @@ def _stream_by_tokens(
                 self._queue_chunk(is_final=True, lag=0)
             # Signal the synth worker that no more jobs are coming
             synth_queue.put(None)
+
+            # Hand the full mel-code sequence back to the API so it can persist
+            # the trailing slice as the next call's prefix. We do this here
+            # (not in the synth worker) because all_tokens is owned by the
+            # streamer and is the cleanest single source of truth.
+            if on_codes_complete is not None and self.all_tokens:
+                try:
+                    on_codes_complete(
+                        torch.tensor(self.all_tokens, dtype=torch.long)
+                    )
+                except Exception as e:
+                    # Best-effort: session persistence failure must not break
+                    # the audio stream.
+                    if config.verbose:
+                        print(f"  [Stream] on_codes_complete raised: {e}")
 
             if config.verbose:
                 total_time = time.perf_counter() - stream_start_time

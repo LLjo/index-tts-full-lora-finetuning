@@ -244,6 +244,25 @@ function setupEventListeners() {
     document.getElementById('generateBtn').addEventListener('click', generateSpeech);
     document.getElementById('streamBtn').addEventListener('click', streamSpeech);
 
+    // Stream-split mode controls: show the slider only in "words" mode and
+    // mirror its value into the label as the user drags.
+    const splitModeEl = document.getElementById('streamingSplitMode');
+    const wordsGroupEl = document.getElementById('streamingWordsPerChunkGroup');
+    const wordsSliderEl = document.getElementById('streamingWordsPerChunk');
+    const wordsValueEl = document.getElementById('streamingWordsPerChunkValue');
+    if (splitModeEl && wordsGroupEl) {
+        const syncSplitMode = () => {
+            wordsGroupEl.style.display = splitModeEl.value === 'words' ? 'block' : 'none';
+        };
+        splitModeEl.addEventListener('change', syncSplitMode);
+        syncSplitMode();
+    }
+    if (wordsSliderEl && wordsValueEl) {
+        wordsSliderEl.addEventListener('input', () => {
+            wordsValueEl.textContent = wordsSliderEl.value;
+        });
+    }
+
     // Training
     document.getElementById('startTrainingBtn').addEventListener('click', startTraining);
 
@@ -564,6 +583,158 @@ async function generateSpeech() {
     }
 }
 
+// ── Split helpers — mirror the Wyoming bridge's sentence regex so the UI's
+// "sentence" mode behaves the same as production. "words" mode is a deliberate
+// stress test for cross-call continuity (cuts mid-sentence on purpose).
+
+function splitTextSentences(text) {
+    const re = /([.!?]+(?=\s)|\n{2,})/g;
+    const out = [];
+    let lastIdx = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const end = m.index + m[0].length;
+        const sent = text.slice(lastIdx, end).trim();
+        if (sent) out.push(sent);
+        lastIdx = end;
+    }
+    const tail = text.slice(lastIdx).trim();
+    if (tail) out.push(tail);
+    return out.length ? out : [text.trim()];
+}
+
+function splitTextWords(text, wordsPerChunk) {
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return [text.trim()];
+    const out = [];
+    for (let i = 0; i < words.length; i += wordsPerChunk) {
+        out.push(words.slice(i, i + wordsPerChunk).join(' '));
+    }
+    return out;
+}
+
+// Phrase split: cuts on commas, semicolons, colons (when followed by space)
+// and the sentence-terminator set. Better than sentence-only for long
+// run-on prose where one sentence might run >100 chars.
+function splitTextPhrases(text) {
+    const re = /([,;:.!?]+(?=\s)|\n{2,})/g;
+    const out = [];
+    let lastIdx = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const end = m.index + m[0].length;
+        const phrase = text.slice(lastIdx, end).trim();
+        // Skip extremely short phrases (< 4 chars) so we don't emit ", "
+        // as its own request. Fuse them with the next phrase instead.
+        if (phrase.length >= 4) {
+            out.push(phrase);
+            lastIdx = end;
+        }
+    }
+    const tail = text.slice(lastIdx).trim();
+    if (tail) out.push(tail);
+    return out.length ? out : [text.trim()];
+}
+
+function getStreamChunks(text) {
+    const modeEl = document.getElementById('streamingSplitMode');
+    const mode = modeEl ? modeEl.value : 'phrase';
+    if (mode === 'words') {
+        const sliderEl = document.getElementById('streamingWordsPerChunk');
+        const n = sliderEl ? parseInt(sliderEl.value, 10) : 8;
+        return { mode, chunks: splitTextWords(text, Math.max(1, n)) };
+    }
+    if (mode === 'sentence') {
+        return { mode, chunks: splitTextSentences(text) };
+    }
+    if (mode === 'phrase') {
+        return { mode, chunks: splitTextPhrases(text) };
+    }
+    return { mode: 'none', chunks: [text.trim()] };
+}
+
+// Single /inference/stream call. Reads the WAV header off the first response
+// chunk to learn the sample rate, then schedules each PCM chunk into the
+// shared AudioContext at `state.nextStartTime`. The state object is mutated
+// in place so consecutive chunks play gapless.
+async function streamOneChunk(textChunk, requestExtras, audioFile, state) {
+    const formData = new FormData();
+    if (audioFile) formData.append('audio_file', audioFile);
+    formData.append('request_json', JSON.stringify({
+        ...state.baseRequest,
+        text: textChunk,
+        ...requestExtras,
+    }));
+
+    const response = await fetch(`${API_BASE}/inference/stream`, {
+        method: 'POST',
+        body: formData,
+    });
+    if (!response.ok) throw new Error(await response.text() || 'Streaming failed');
+
+    const reader = response.body.getReader();
+    let isFirstChunkOfResponse = true;
+    let leftover = new Uint8Array(0);
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const combined = new Uint8Array(leftover.length + value.length);
+        combined.set(leftover);
+        combined.set(value, leftover.length);
+        let processData = combined;
+
+        // Each response carries its own 44-byte WAV header, so we strip per
+        // response, not per batch. (Sample rate is the same across requests
+        // for one model — we capture it on the first batch only.)
+        if (isFirstChunkOfResponse) {
+            if (combined.length < 44) { leftover = combined; continue; }
+            const view = new DataView(combined.buffer, combined.byteOffset, combined.byteLength);
+            const channels = view.getUint16(22, true);
+            const sampleRate = view.getUint32(24, true);
+            if (state.sampleRate === null) {
+                state.sampleRate = sampleRate;
+                state.channels = channels;
+            }
+            processData = combined.slice(44);
+            isFirstChunkOfResponse = false;
+        }
+
+        const remainder = processData.length % 2;
+        if (remainder !== 0) {
+            leftover = processData.slice(processData.length - 1);
+            processData = processData.slice(0, processData.length - 1);
+        } else {
+            leftover = new Uint8Array(0);
+        }
+
+        if (processData.length === 0) continue;
+
+        const audioFloat32 = convertInt16ToFloat32(processData);
+        const audioBuffer = state.audioContext.createBuffer(
+            state.channels, audioFloat32.length, state.sampleRate
+        );
+        audioBuffer.getChannelData(0).set(audioFloat32);
+
+        const source = state.audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(state.audioContext.destination);
+
+        if (state.nextStartTime < state.audioContext.currentTime) {
+            state.nextStartTime = state.audioContext.currentTime + 0.05;
+        }
+        source.start(state.nextStartTime);
+        state.nextStartTime += audioBuffer.duration;
+
+        state.chunkCount += 1;
+        showProgress(
+            `Streaming... part ${state.partIdx}/${state.partTotal}, chunk ${state.chunkCount}`,
+            50,
+        );
+    }
+}
+
 async function streamSpeech() {
     const text = document.getElementById('inferenceText').value.trim();
     const audioFile = document.getElementById('referenceAudio').files[0];
@@ -588,18 +759,11 @@ async function streamSpeech() {
             await audioContext.resume();
         }
 
-        const formData = new FormData();
-        if (audioFile) formData.append('audio_file', audioFile);
-
-        // Check if we have any emotion values set
         const hasEmotionVector = emotionVector.some(v => v > 0);
-
-        // Streaming preset chosen on the Inference tab. Defaults to ultra_fast.
         const presetEl = document.getElementById('streamingPreset');
         const streamingPreset = presetEl ? presetEl.value : 'ultra_fast';
 
-        const requestData = {
-            text: text,
+        const baseRequest = {
             speaker: speaker || null,
             use_patterns: usePatterns,
             temperature: parseFloat(document.getElementById('temperature').value),
@@ -612,80 +776,52 @@ async function streamSpeech() {
             ...inferOverridePayload(),
         };
 
-        formData.append('request_json', JSON.stringify(requestData));
+        const { mode, chunks } = getStreamChunks(text);
+        // Only attach a session_id when we'll actually need cross-call
+        // continuity (>1 chunk). Single-chunk runs stay byte-identical to
+        // the old behavior.
+        const sessionId = (chunks.length > 1)
+            ? `ui-${crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2)}`
+            : null;
+        console.log(
+            `Stream: mode=${mode}  chunks=${chunks.length}  session=${sessionId || '<off>'}`,
+        );
 
-        const response = await fetch(`${API_BASE}/inference/stream`, {
-            method: 'POST',
-            body: formData
-        });
+        const state = {
+            audioContext,
+            baseRequest,
+            sampleRate: null,
+            channels: 1,
+            nextStartTime: audioContext.currentTime,
+            chunkCount: 0,
+            partIdx: 0,
+            partTotal: chunks.length,
+        };
 
-        if (!response.ok) throw new Error(await response.text() || 'Streaming failed');
+        for (let i = 0; i < chunks.length; i++) {
+            state.partIdx = i + 1;
+            const extras = sessionId
+                ? { session_id: sessionId, session_reset: i === 0 }
+                : {};
+            await streamOneChunk(chunks[i], extras, audioFile, state);
+        }
 
-        const reader = response.body.getReader();
-        
-        let nextStartTime = audioContext.currentTime;
-        let chunkCount = 0;
-        let isFirstChunk = true;
-        let sampleRate = 24000; 
-        let channels = 1;
-        let leftoverChunk = new Uint8Array(0);
-
-        console.log('Stream connection established. Playing...');
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const combinedData = new Uint8Array(leftoverChunk.length + value.length);
-            combinedData.set(leftoverChunk);
-            combinedData.set(value, leftoverChunk.length);
-
-            let processData = combinedData;
-
-            if (isFirstChunk) {
-                if (combinedData.length >= 44) {
-                    const view = new DataView(combinedData.buffer, combinedData.byteOffset, combinedData.byteLength);
-                    channels = view.getUint16(22, true);
-                    sampleRate = view.getUint32(24, true);
-                    processData = combinedData.slice(44);
-                    isFirstChunk = false;
-                } else {
-                    leftoverChunk = combinedData;
-                    continue; 
-                }
-            }
-
-            const remainder = processData.length % 2;
-            if (remainder !== 0) {
-                leftoverChunk = processData.slice(processData.length - 1);
-                processData = processData.slice(0, processData.length - 1);
-            } else {
-                leftoverChunk = new Uint8Array(0);
-            }
-
-            if (processData.length > 0) {
-                const audioFloat32 = convertInt16ToFloat32(processData);
-                const audioBuffer = audioContext.createBuffer(channels, audioFloat32.length, sampleRate);
-                audioBuffer.getChannelData(0).set(audioFloat32);
-
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioContext.destination);
-
-                if (nextStartTime < audioContext.currentTime) {
-                    nextStartTime = audioContext.currentTime + 0.05;
-                }
-
-                source.start(nextStartTime);
-                nextStartTime += audioBuffer.duration;
-
-                chunkCount++;
-                showProgress(`Streaming... Chunk ${chunkCount}`, 50);
-            }
+        // Tidy: drop the session server-side now that we're done. TTL would
+        // do it anyway but explicit is cheaper and avoids confusion if the
+        // user immediately runs another test.
+        if (sessionId) {
+            fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}`, {
+                method: 'DELETE',
+            }).catch(() => {});
         }
 
         hideProgress();
-        showNotification('Stream finished', 'success');
+        showNotification(
+            chunks.length > 1
+                ? `Stream finished (${chunks.length} parts, ${mode} split, session continuity on)`
+                : 'Stream finished',
+            'success',
+        );
 
     } catch (error) {
         console.error('Streaming failed:', error);
@@ -693,7 +829,7 @@ async function streamSpeech() {
         showNotification(error.message || 'Failed to stream speech', 'error');
     } finally {
         streamBtn.disabled = false;
-        streamBtn.innerHTML = '<span class="btn-icon">🎙️</span> Stream Speech';
+        streamBtn.innerHTML = '<span class="btn-icon">📡</span> Stream Speech';
     }
 }
 

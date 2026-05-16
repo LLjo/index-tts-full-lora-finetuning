@@ -35,6 +35,12 @@ Env vars:
   INDEXTTS_LANGUAGE        (default: en)
   INDEXTTS_ATTRIB_NAME     (default: IndexTTS2)
   INDEXTTS_ATTRIB_URL      (default: https://github.com/index-tts/index-tts)
+  INDEXTTS_WYOMING_USE_SESSION    (default: true — cross-sentence prosody
+                                   continuity via /inference/stream's session
+                                   API; see docs/SESSION_CONTINUITY_PLAN.md)
+  INDEXTTS_WYOMING_TAIL_S         (optional float; overrides server default
+                                   for how many seconds of the previous
+                                   sentence to retain as the style prompt)
 
 Reference-audio resolution chain (per synthesize call):
   1. If INDEXTTS_REFERENCE_AUDIO is set, upload that file. The API caches
@@ -61,6 +67,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 import httpx
@@ -168,7 +175,19 @@ def _settings() -> dict:
         "language": os.environ.get("INDEXTTS_LANGUAGE", "en"),
         "attrib_name": os.environ.get("INDEXTTS_ATTRIB_NAME", "IndexTTS2"),
         "attrib_url": os.environ.get("INDEXTTS_ATTRIB_URL", "https://github.com/index-tts/index-tts"),
+        # Cross-sentence prosody continuity (see docs/SESSION_CONTINUITY_PLAN.md).
+        # One session per HA synthesize-start ⇒ -stop pairing. The first
+        # sentence sends session_reset=true to wipe any stale state.
+        "use_session": _envb("INDEXTTS_WYOMING_USE_SESSION", True),
+        "session_tail_seconds": _opt_float(os.environ.get("INDEXTTS_WYOMING_TAIL_S")),
     }
+
+
+def _envb(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 _AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
@@ -290,6 +309,18 @@ async def _client() -> httpx.AsyncClient:
     return _HTTP_CLIENT
 
 
+async def _drop_session(api_url: str, session_id: str) -> None:
+    """Best-effort DELETE /sessions/<id>. Called after a synthesize-stop so
+    the API forgets the rolling style prompt before the next HA utterance —
+    different topic, different emotion, no carry-over wanted."""
+    try:
+        client = await _client()
+        await client.delete(f"{api_url}/sessions/{session_id}", timeout=5)
+    except Exception as e:
+        # Not fatal — the API's TTL sweeper will drop it eventually.
+        LOG.debug("session %s delete failed: %s", session_id, e)
+
+
 async def _ensure_voice_loaded(api_url: str, voice_name: str) -> None:
     """Call /models/load/<voice> only when the requested voice changed.
 
@@ -315,12 +346,22 @@ async def _ensure_voice_loaded(api_url: str, voice_name: str) -> None:
         _CURRENT_LOADED_VOICE = voice_name
 
 
-def _build_request_body(text: str, voice_name: str, settings: dict) -> dict:
+def _build_request_body(
+    text: str,
+    voice_name: str,
+    settings: dict,
+    *,
+    session_id: str | None = None,
+    session_reset: bool = False,
+) -> dict:
     """Construct the JSON body for /inference/stream.
 
     Mirrors what the WebUI sends. use_patterns=True so the API attaches whatever
     pattern_embedding / character LoRA the speaker has. The character LoRA gets
     merged via /models/load/<voice> — see _ensure_voice_loaded.
+
+    `session_id` plumbs cross-sentence prosody continuity — see
+    docs/SESSION_CONTINUITY_PLAN.md. Pass None to disable for this call.
     """
     body: dict = {
         "text": text,
@@ -329,6 +370,12 @@ def _build_request_body(text: str, voice_name: str, settings: dict) -> dict:
         "verbose": False,
         "streaming_preset": settings["preset"],
     }
+    if session_id is not None:
+        body["session_id"] = session_id
+        if session_reset:
+            body["session_reset"] = True
+        if settings.get("session_tail_seconds") is not None:
+            body["session_tail_seconds"] = float(settings["session_tail_seconds"])
 
     # Precedence for solver / steps / cfg:
     #   1. Explicit env-var override (e.g. INDEXTTS_SOLVER_OVERRIDE).
@@ -384,6 +431,14 @@ class IndexTTSHandler(AsyncEventHandler):
         # serial, so big concurrency wastes uploads/memory; 2 = current + 1
         # warm lookahead, which is enough to fill any gap.
         self._stream_synth_sem: asyncio.Semaphore = asyncio.Semaphore(2)
+        # ── Cross-sentence prosody continuity (see docs/SESSION_CONTINUITY_PLAN.md) ──
+        # One opaque session_id per HA synthesize-start ⇒ -stop. The API
+        # carries the tail of each sentence's audio forward as the style
+        # prompt for the next. `_session_first_call` makes the first
+        # sentence under a fresh session emit session_reset=true so any
+        # stale state from a crashed prior session is wiped before use.
+        self._session_id: str | None = None
+        self._session_first_call: bool = True
 
     def _pick_voice(self, requested) -> str | None:
         if requested is not None and getattr(requested, "name", None):
@@ -439,7 +494,18 @@ class IndexTTSHandler(AsyncEventHandler):
             self._stream_writer_task = asyncio.create_task(
                 self._stream_writer(self._stream_pipeline_q)
             )
-            LOG.info("[STREAM] synthesize-start  voice=%s", self._stream_voice)
+            # Fresh session for this utterance. Tail from the previous
+            # utterance was already DELETEd in synthesize-stop; the
+            # session_reset=true on the first sentence is a belt-and-braces
+            # safety net for crashed prior sessions.
+            if self.settings.get("use_session", True):
+                self._session_id = f"wy-{uuid.uuid4().hex[:12]}"
+                self._session_first_call = True
+            else:
+                self._session_id = None
+                self._session_first_call = False
+            LOG.info("[STREAM] synthesize-start  voice=%s  session=%s",
+                     self._stream_voice, self._session_id or "<off>")
             return True
 
         if SynthesizeChunk.is_type(event.type):
@@ -463,12 +529,19 @@ class IndexTTSHandler(AsyncEventHandler):
             if remaining:
                 self._kickoff_sentence(remaining)
 
+            # Snapshot the session_id before clearing — we DELETE it on the
+            # API after the writer finishes so the server-side tail is gone
+            # by the time the next HA utterance arrives.
+            finished_session = self._session_id
+
             # Clear handler state so a fresh session can start cleanly even
             # while the writer is still draining.
             self._stream_voice = None
             self._stream_sentences = None
             self._stream_pipeline_q = None
             self._stream_writer_task = None
+            self._session_id = None
+            self._session_first_call = True
 
             # Signal end-of-stream and wait for writer to finish (it emits
             # AudioStop on its way out if any audio was actually written).
@@ -479,6 +552,16 @@ class IndexTTSHandler(AsyncEventHandler):
                     await writer_task
                 except Exception:
                     LOG.exception("stream writer task failed")
+
+            # Fire-and-forget delete of the session on the API. Doing this
+            # AFTER the writer drains guarantees the tail isn't deleted
+            # mid-flight while a still-running synth_to_queue task might
+            # need it. (Sentences fan out in order, so the last one always
+            # finishes last, but we wait for the writer to be safe.)
+            if finished_session is not None:
+                asyncio.create_task(_drop_session(
+                    self.settings["api_url"], finished_session
+                ))
 
             await self.write_event(SynthesizeStopped().event())
             LOG.info("[STREAM] sent SynthesizeStopped")
@@ -500,8 +583,19 @@ class IndexTTSHandler(AsyncEventHandler):
         # Stamp the queue with the sentence text so the writer can log it.
         chunks_q._sentence = sentence  # type: ignore[attr-defined]
         self._stream_pipeline_q.put_nowait(chunks_q)
+        # Snapshot session state for THIS sentence: subsequent sentences
+        # must not also send session_reset=true, so flip the flag here
+        # rather than inside the (concurrent) synth task.
+        sentence_session_id = self._session_id
+        sentence_session_reset = self._session_first_call
+        if self._session_first_call:
+            self._session_first_call = False
         asyncio.create_task(
-            self._synth_to_queue(sentence, self._stream_voice, chunks_q)
+            self._synth_to_queue(
+                sentence, self._stream_voice, chunks_q,
+                session_id=sentence_session_id,
+                session_reset=sentence_session_reset,
+            )
         )
         LOG.info("[STREAM] queued sentence  text=%r", sentence[:80])
 
@@ -510,12 +604,18 @@ class IndexTTSHandler(AsyncEventHandler):
         sentence: str,
         voice_name: str,
         chunks_q: asyncio.Queue,
+        *,
+        session_id: str | None = None,
+        session_reset: bool = False,
     ) -> None:
         """POST the sentence to the TTS API and push PCM pieces into chunks_q.
         Always terminates with a None sentinel so the writer doesn't hang."""
         try:
             async with self._stream_synth_sem:
-                await self._do_post_and_queue(sentence, voice_name, chunks_q)
+                await self._do_post_and_queue(
+                    sentence, voice_name, chunks_q,
+                    session_id=session_id, session_reset=session_reset,
+                )
         except Exception:
             LOG.exception("synth_to_queue failed for sentence=%r", sentence[:60])
         finally:
@@ -526,10 +626,16 @@ class IndexTTSHandler(AsyncEventHandler):
         sentence: str,
         voice_name: str,
         chunks_q: asyncio.Queue,
+        *,
+        session_id: str | None = None,
+        session_reset: bool = False,
     ) -> None:
         api_url = self.settings["api_url"]
         await _ensure_voice_loaded(api_url, voice_name)
-        body = _build_request_body(sentence, voice_name, self.settings)
+        body = _build_request_body(
+            sentence, voice_name, self.settings,
+            session_id=session_id, session_reset=session_reset,
+        )
         ref_path = _resolve_reference_audio(voice_name, self.settings)
         files: dict = {"request_json": (None, json.dumps(body))}
         ref_fh = None
