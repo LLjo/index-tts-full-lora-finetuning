@@ -83,9 +83,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Boundary = sentence terminator + whitespace, OR a paragraph break.
 # Negative lookbehind on digits prevents splitting numbered lists ("1. Foo").
 _SENTENCE_BOUNDARY_RE = re.compile(r'(?<![0-9])[.!?]+(?=\s)|\n{2,}')
-# Sentences shorter than this aren't worth a separate TTS roundtrip; they get
-# fused with the next one. Keeps "Sure!" + "Here's a recipe..." as one call.
-_MIN_SENTENCE_CHARS = 30
+# Sentences shorter than this get fused with the next one. Smaller = faster
+# time-to-first-audio; larger = better intra-sentence prosody. We use a very
+# small threshold for the FIRST sentence (so e.g. "Sure!" emits immediately
+# and the user hears something fast) and a larger one for subsequent sentences
+# (so body prose doesn't get chopped into awkward fragments).
+_FIRST_SENTENCE_MIN_CHARS = 5
+_SUBSEQUENT_SENTENCE_MIN_CHARS = 30
 
 
 class _SentenceStream:
@@ -98,6 +102,7 @@ class _SentenceStream:
     def __init__(self) -> None:
         self._buf = ""
         self._search_from = 0  # next regex search starts here (skips rejected boundaries)
+        self._emitted = 0  # how many sentences we've returned in this session
 
     def feed(self, text: str) -> list[str]:
         self._buf += text
@@ -108,8 +113,11 @@ class _SentenceStream:
                 break
             cut = m.end()
             sentence = self._buf[:cut].strip()
-            if len(sentence) >= _MIN_SENTENCE_CHARS:
+            min_chars = (_FIRST_SENTENCE_MIN_CHARS if self._emitted == 0
+                         else _SUBSEQUENT_SENTENCE_MIN_CHARS)
+            if len(sentence) >= min_chars:
                 out.append(sentence)
+                self._emitted += 1
                 self._buf = self._buf[cut:].lstrip()
                 self._search_from = 0
             else:
@@ -244,6 +252,37 @@ async def _fetch_voices(api_url: str) -> list[TtsVoice]:
     return voices
 
 
+async def _fetch_active_distilled_speaker(api_url: str) -> str | None:
+    """Query /distill/active-status to find which speaker's distilled CFM
+    student is currently loaded in the running model. Returns the speaker
+    name (so we can auto-apply single_step + 1 step + CFG=0 for that voice)
+    or None if no distilled student is in use.
+
+    Cached at bridge startup — if the user activates a different student via
+    the WebUI after startup, they need to restart the bridge."""
+    try:
+        client = await _client()
+        r = await client.get(f"{api_url}/distill/active-status", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        LOG.info("Could not query /distill/active-status (%s) — distilled "
+                 "auto-detection disabled this run.", e)
+        return None
+    if not data.get("in_use"):
+        LOG.info("No distilled CFM student is active. Using preset solver.")
+        return None
+    speaker = data.get("speaker_match")
+    if speaker:
+        LOG.info("Distilled student active for speaker=%s — will auto-apply "
+                 "single_step / 1 step / CFG=0 for that voice.", speaker)
+    else:
+        LOG.info("Distilled student is active but speaker is unknown — "
+                 "single_step won't be auto-applied (set INDEXTTS_SOLVER_OVERRIDE "
+                 "manually if you want it).")
+    return speaker
+
+
 async def _client() -> httpx.AsyncClient:
     global _HTTP_CLIENT
     if _HTTP_CLIENT is None:
@@ -290,12 +329,32 @@ def _build_request_body(text: str, voice_name: str, settings: dict) -> dict:
         "verbose": False,
         "streaming_preset": settings["preset"],
     }
-    if settings["solver_override"]:
-        body["solver_override"] = settings["solver_override"]
-    if settings["diffusion_steps_override"] is not None:
-        body["diffusion_steps_override"] = settings["diffusion_steps_override"]
-    if settings["cfg_override"] is not None:
-        body["inference_cfg_override"] = settings["cfg_override"]
+
+    # Precedence for solver / steps / cfg:
+    #   1. Explicit env-var override (e.g. INDEXTTS_SOLVER_OVERRIDE).
+    #   2. Auto-detect: if a distilled CFM student is active in the running
+    #      model AND it belongs to the voice we're synthesizing, use
+    #      single_step / 1 step / CFG=0 — the regime the student was trained
+    #      for. Saves several diffusion roundtrips per chunk.
+    #   3. Otherwise leave it to the preset.
+    solver = settings.get("solver_override")
+    steps = settings.get("diffusion_steps_override")
+    cfg = settings.get("cfg_override")
+
+    if voice_name == settings.get("distilled_speaker"):
+        if solver is None:
+            solver = "single_step"
+        if steps is None:
+            steps = 1
+        if cfg is None:
+            cfg = 0.0
+
+    if solver:
+        body["solver_override"] = solver
+    if steps is not None:
+        body["diffusion_steps_override"] = steps
+    if cfg is not None:
+        body["inference_cfg_override"] = cfg
     return body
 
 
@@ -308,17 +367,23 @@ class IndexTTSHandler(AsyncEventHandler):
         super().__init__(*args, **kwargs)
         self.settings = settings
         self.voices = voices
-        # Streaming-synthesis state. HA 2025.10+ sends synthesize-start,
-        # one or more synthesize-chunk, then synthesize-stop instead of a
-        # single legacy `synthesize` event when supports_synthesize_streaming
-        # is advertised. We split incoming text into sentences and start TTS
-        # as soon as each sentence completes, so playback can begin while the
-        # LLM is still streaming.
+        # ── Streaming-synthesis state (HA 2025.10+ synthesize-start/chunk/stop) ──
+        # We split incoming text into sentences and pipeline their synthesis:
+        # each sentence's API call runs concurrently in the background, while a
+        # single writer task drains audio chunks to Wyoming in sentence order.
+        # This eliminates inter-sentence gaps: by the time the writer finishes
+        # emitting sentence N's audio, sentence N+1's API call is already in
+        # flight (and may have data buffered) so N+1's first byte hits Wyoming
+        # immediately.
         self._stream_voice: str | None = None
         self._stream_sentences: _SentenceStream | None = None
-        # Whether we've already emitted an AudioStart for the current
-        # streaming session. Subsequent sentence syntheses skip it.
-        self._stream_audio_started: bool = False
+        # Outer FIFO of per-sentence chunk queues; the writer task drains in order.
+        self._stream_pipeline_q: asyncio.Queue | None = None
+        self._stream_writer_task: asyncio.Task | None = None
+        # Limit concurrent API calls. The API is GPU-bound and effectively
+        # serial, so big concurrency wastes uploads/memory; 2 = current + 1
+        # warm lookahead, which is enough to fill any gap.
+        self._stream_synth_sem: asyncio.Semaphore = asyncio.Semaphore(2)
 
     def _pick_voice(self, requested) -> str | None:
         if requested is not None and getattr(requested, "name", None):
@@ -362,14 +427,18 @@ class IndexTTSHandler(AsyncEventHandler):
             return True
 
         # Streaming path: synthesize-start / -chunk / -stop.
-        # Strategy: extract sentences from incoming chunks and start
-        # synthesizing each as soon as it completes. AudioStart fires once
-        # on the first sentence; AudioStop once at stream end.
+        # Each completed sentence kicks off a background API call whose audio
+        # chunks land in a per-sentence queue. A single writer task drains
+        # those queues IN ORDER, emitting one AudioStart at the very first
+        # byte and one AudioStop at end-of-stream.
         if SynthesizeStart.is_type(event.type):
             start = SynthesizeStart.from_event(event)
             self._stream_voice = self._pick_voice(start.voice)
             self._stream_sentences = _SentenceStream()
-            self._stream_audio_started = False
+            self._stream_pipeline_q = asyncio.Queue()
+            self._stream_writer_task = asyncio.create_task(
+                self._stream_writer(self._stream_pipeline_q)
+            )
             LOG.info("[STREAM] synthesize-start  voice=%s", self._stream_voice)
             return True
 
@@ -378,47 +447,39 @@ class IndexTTSHandler(AsyncEventHandler):
             if self._stream_sentences is None or self._stream_voice is None:
                 LOG.warning("synthesize-chunk received outside a streaming session")
                 return True
-            sentences = self._stream_sentences.feed(chunk.text)
-            for sentence in sentences:
-                LOG.info("[STREAM] synthesizing sentence  text=%r", sentence[:80])
-                try:
-                    await self._synthesize(
-                        sentence,
-                        self._stream_voice,
-                        manage_audio_session=False,
-                    )
-                except Exception:
-                    LOG.exception("Sentence synthesize failed")
+            for sentence in self._stream_sentences.feed(chunk.text):
+                self._kickoff_sentence(sentence)
             return True
 
         if SynthesizeStop.is_type(event.type):
-            voice_name = self._stream_voice
             sentences = self._stream_sentences
-            audio_started = self._stream_audio_started
+            pipeline_q = self._stream_pipeline_q
+            writer_task = self._stream_writer_task
+
+            # Flush trailing text and queue it as the final sentence.
+            remaining = sentences.flush() if sentences else None
+            LOG.info("[STREAM] synthesize-stop  trailing=%r",
+                     (remaining or "")[:80])
+            if remaining:
+                self._kickoff_sentence(remaining)
+
+            # Clear handler state so a fresh session can start cleanly even
+            # while the writer is still draining.
             self._stream_voice = None
             self._stream_sentences = None
-            self._stream_audio_started = False
+            self._stream_pipeline_q = None
+            self._stream_writer_task = None
 
-            remaining = sentences.flush() if sentences else None
-            LOG.info("[STREAM] synthesize-stop  voice=%s  trailing=%r",
-                     voice_name, (remaining or "")[:80])
-
-            if remaining and voice_name is not None:
+            # Signal end-of-stream and wait for writer to finish (it emits
+            # AudioStop on its way out if any audio was actually written).
+            if pipeline_q is not None:
+                await pipeline_q.put(None)
+            if writer_task is not None:
                 try:
-                    await self._synthesize(
-                        remaining,
-                        voice_name,
-                        manage_audio_session=False,
-                    )
-                    audio_started = audio_started or self._stream_audio_started
+                    await writer_task
                 except Exception:
-                    LOG.exception("Final sentence synthesize failed")
+                    LOG.exception("stream writer task failed")
 
-            # Close the audio session if we ever opened it. If we never
-            # synthesized anything (empty stream), we still send Stopped so
-            # HA doesn't hang.
-            if audio_started:
-                await self.write_event(AudioStop().event())
             await self.write_event(SynthesizeStopped().event())
             LOG.info("[STREAM] sent SynthesizeStopped")
             return True
@@ -428,20 +489,126 @@ class IndexTTSHandler(AsyncEventHandler):
         LOG.debug("[bridge] unhandled event type=%s", event.type)
         return True
 
+    def _kickoff_sentence(self, sentence: str) -> None:
+        """Fire-and-forget a synthesis task for `sentence` and register its
+        per-sentence chunk queue with the pipeline writer. The chunk handler
+        returns immediately; the writer drains queues in arrival order."""
+        if self._stream_pipeline_q is None or self._stream_voice is None:
+            LOG.warning("_kickoff_sentence with no active stream — dropping %r", sentence[:60])
+            return
+        chunks_q: asyncio.Queue = asyncio.Queue()
+        # Stamp the queue with the sentence text so the writer can log it.
+        chunks_q._sentence = sentence  # type: ignore[attr-defined]
+        self._stream_pipeline_q.put_nowait(chunks_q)
+        asyncio.create_task(
+            self._synth_to_queue(sentence, self._stream_voice, chunks_q)
+        )
+        LOG.info("[STREAM] queued sentence  text=%r", sentence[:80])
+
+    async def _synth_to_queue(
+        self,
+        sentence: str,
+        voice_name: str,
+        chunks_q: asyncio.Queue,
+    ) -> None:
+        """POST the sentence to the TTS API and push PCM pieces into chunks_q.
+        Always terminates with a None sentinel so the writer doesn't hang."""
+        try:
+            async with self._stream_synth_sem:
+                await self._do_post_and_queue(sentence, voice_name, chunks_q)
+        except Exception:
+            LOG.exception("synth_to_queue failed for sentence=%r", sentence[:60])
+        finally:
+            chunks_q.put_nowait(None)
+
+    async def _do_post_and_queue(
+        self,
+        sentence: str,
+        voice_name: str,
+        chunks_q: asyncio.Queue,
+    ) -> None:
+        api_url = self.settings["api_url"]
+        await _ensure_voice_loaded(api_url, voice_name)
+        body = _build_request_body(sentence, voice_name, self.settings)
+        ref_path = _resolve_reference_audio(voice_name, self.settings)
+        files: dict = {"request_json": (None, json.dumps(body))}
+        ref_fh = None
+        if ref_path is not None:
+            ref_fh = open(ref_path, "rb")
+            files["audio_file"] = (ref_path.name, ref_fh, "audio/wav")
+            body["cond_cache_key"] = str(ref_path)
+            files["request_json"] = (None, json.dumps(body))
+        client = await _client()
+        LOG.info("Synthesize  voice=%s  ref=%s  text=%r",
+                 voice_name, ref_path.name if ref_path else "<embeddings>", sentence[:80])
+        try:
+            async with client.stream(
+                "POST", f"{api_url}/inference/stream?raw_pcm=true", files=files,
+            ) as resp:
+                if not resp.is_success:
+                    body_text = (await resp.aread()).decode("utf-8", "replace")
+                    LOG.error("stream %s: %s", resp.status_code, body_text[:200])
+                    return
+                leftover = b""
+                async for raw in resp.aiter_bytes(chunk_size=WYOMING_CHUNK_BYTES):
+                    if not raw:
+                        continue
+                    buf = leftover + raw
+                    n_full = (len(buf) // SAMPLE_WIDTH) * SAMPLE_WIDTH
+                    if n_full:
+                        i = 0
+                        while i < n_full:
+                            piece = buf[i : i + WYOMING_CHUNK_BYTES]
+                            chunks_q.put_nowait(piece)
+                            i += len(piece)
+                    leftover = buf[n_full:]
+                if leftover:
+                    LOG.warning("Trailing %d bytes of unaligned PCM dropped", len(leftover))
+        finally:
+            if ref_fh is not None:
+                try: ref_fh.close()
+                except Exception: pass
+
+    async def _stream_writer(self, pipeline_q: asyncio.Queue) -> None:
+        """Drain per-sentence chunk queues from `pipeline_q` in order and
+        write AudioChunks to Wyoming. Emits one AudioStart at the first
+        chunk and one AudioStop when the pipeline closes."""
+        audio_started = False
+        try:
+            while True:
+                chunks_q = await pipeline_q.get()
+                if chunks_q is None:
+                    break
+                sentence = getattr(chunks_q, "_sentence", "")
+                first_for_sentence = True
+                while True:
+                    piece = await chunks_q.get()
+                    if piece is None:
+                        break
+                    if not audio_started:
+                        await self.write_event(AudioStart(
+                            rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
+                        ).event())
+                        audio_started = True
+                        LOG.info("[STREAM] first AudioChunk → Wyoming")
+                    if first_for_sentence:
+                        LOG.info("[STREAM] writing audio for %r", sentence[:60])
+                        first_for_sentence = False
+                    await self.write_event(AudioChunk(
+                        rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS, audio=piece,
+                    ).event())
+        finally:
+            if audio_started:
+                await self.write_event(AudioStop().event())
+                LOG.info("[STREAM] AudioStop → Wyoming")
+
     async def _synthesize(
         self,
         text: str,
         voice_name: str,
-        manage_audio_session: bool = True,
     ) -> None:
-        """Synthesize `text` with `voice_name` and stream audio out.
-
-        When manage_audio_session is True (legacy/standalone path), emits
-        AudioStart before the first chunk and AudioStop in finally. When
-        False (sentence-streaming path), the caller owns AudioStart/Stop
-        bookkeeping across multiple sentences; we just emit AudioChunks
-        and set `_stream_audio_started=True` on the first chunk so the
-        caller knows we opened the session."""
+        """Single-shot synthesis path: legacy `Synthesize` events. Emits a
+        complete AudioStart → chunks → AudioStop session for this one text."""
         api_url = self.settings["api_url"]
         # 1. Swap LoRA if needed (cached — usually a no-op on repeated calls)
         await _ensure_voice_loaded(api_url, voice_name)
@@ -467,10 +634,9 @@ class IndexTTSHandler(AsyncEventHandler):
         LOG.info("Synthesize  voice=%s  ref=%s  text=%r",
                  voice_name, ref_path.name if ref_path else "<embeddings>", text[:80])
 
-        if manage_audio_session:
-            await self.write_event(AudioStart(
-                rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
-            ).event())
+        await self.write_event(AudioStart(
+            rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
+        ).event())
 
         try:
             async with client.stream(
@@ -500,12 +666,6 @@ class IndexTTSHandler(AsyncEventHandler):
                         i = 0
                         while i < n_full:
                             piece = buf[i : i + WYOMING_CHUNK_BYTES]
-                            if not manage_audio_session and not self._stream_audio_started:
-                                # First audio of a streaming session — open it now.
-                                await self.write_event(AudioStart(
-                                    rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS,
-                                ).event())
-                                self._stream_audio_started = True
                             await self.write_event(AudioChunk(
                                 rate=SAMPLE_RATE,
                                 width=SAMPLE_WIDTH,
@@ -522,8 +682,7 @@ class IndexTTSHandler(AsyncEventHandler):
             if ref_fh is not None:
                 try: ref_fh.close()
                 except Exception: pass
-            if manage_audio_session:
-                await self.write_event(AudioStop().event())
+            await self.write_event(AudioStop().event())
 
 
 async def main() -> int:
@@ -541,6 +700,12 @@ async def main() -> int:
 
     # Warm the HTTP client; failure here is non-fatal (we retry on each query).
     voices = await _fetch_voices(settings["api_url"])
+
+    # Auto-detect which speaker (if any) has a distilled CFM student loaded.
+    # Stash on settings so _build_request_body can apply single_step overrides
+    # for that one voice. Querying once at startup keeps the per-request path
+    # synchronous; restart the bridge if you activate a different student.
+    settings["distilled_speaker"] = await _fetch_active_distilled_speaker(settings["api_url"])
 
     def handler_factory(reader, writer):
         return IndexTTSHandler(reader, writer, settings=settings, voices=voices)

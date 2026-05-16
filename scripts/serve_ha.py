@@ -53,7 +53,14 @@ def _load_env_file(path: Path) -> None:
         os.environ.setdefault(key, val)
 
 
-_load_env_file(ROOT / ".env.indextts")
+_env_primary = ROOT / ".env.indextts"
+if _env_primary.exists():
+    _load_env_file(_env_primary)
+else:
+    print(f"[serve_ha] WARNING: {_env_primary.name} not found — running with "
+          f"defaults only. Run `cp .env.indextts.example .env.indextts` and "
+          f"edit it to customize preset, solver overrides, default speaker, etc.",
+          flush=True)
 
 API_HOST = os.environ.get("INDEXTTS_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("INDEXTTS_API_PORT", "8000"))
@@ -67,14 +74,58 @@ def log(msg: str) -> None:
     print(f"[serve_ha] {msg}", flush=True)
 
 
-def http_post(url: str, timeout: int = 600) -> dict:
-    req = urllib.request.Request(url, method="POST")
+def http_post(url: str, timeout: int = 600, body: dict | None = None) -> dict:
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        body = r.read().decode("utf-8", "replace")
+        body_text = r.read().decode("utf-8", "replace")
         try:
-            return json.loads(body)
+            return json.loads(body_text)
         except json.JSONDecodeError:
-            return {"raw": body}
+            return {"raw": body_text}
+
+
+def _per_speaker_student_path(speaker: str) -> Path:
+    """Where the distilled CFM student lives on disk (if it was trained for
+    this speaker). The API's /distill/activate endpoint copies this file into
+    checkpoints/s2mel_distilled.pth + writes a sidecar so the bridge can map
+    the active student back to its source speaker."""
+    return ROOT / "training" / speaker / "cfm_reflow_student" / "best.pth"
+
+
+def maybe_activate_distilled(api_port: int, speaker: str) -> bool:
+    """If `speaker` has a distilled CFM student on disk, swap it into the
+    active slot via /distill/activate. Returns True iff activation happened
+    (caller should reload the base model). Returns False (and logs the
+    reason) for: no student on disk, API error, or non-fatal 4xx. Never
+    raises — distillation is an optimization, not a hard requirement."""
+    student = _per_speaker_student_path(speaker)
+    if not student.exists():
+        log(f"no distilled student at {student.relative_to(ROOT)} — "
+            f"falling back to the global s2mel_distilled.pth if present.")
+        return False
+    log(f"activating distilled CFM student for speaker={speaker} "
+        f"(source: {student.relative_to(ROOT)})…")
+    try:
+        out = http_post(f"http://localhost:{api_port}/distill/activate",
+                        timeout=30, body={"speaker": speaker})
+        log(f"distill activate: {out.get('status') or out}")
+        return True
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail")
+        except Exception:
+            detail = e.reason
+        log(f"distill activate FAILED ({e.code}): {detail} — continuing "
+            f"without per-speaker student.")
+        return False
+    except Exception as e:
+        log(f"distill activate FAILED ({e}) — continuing without per-speaker student.")
+        return False
 
 
 def wait_for_health(url: str, timeout_s: int) -> bool:
@@ -140,6 +191,13 @@ def main() -> int:
     if not wait_for_health(health_url, HEALTH_TIMEOUT):
         _cleanup()
         return 1
+
+    # If the default speaker has a distilled CFM student on disk, copy it
+    # into the active slot BEFORE loading the base model — the model reads
+    # checkpoints/s2mel_distilled.pth at load time, so activating after
+    # would require a costly reload.
+    if DEFAULT_SPEAKER:
+        maybe_activate_distilled(API_PORT, DEFAULT_SPEAKER)
 
     log("API is healthy — loading base model (30-60s)…")
     try:
