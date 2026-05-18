@@ -121,6 +121,17 @@ measurement.
   (`gpt_lora_kind == "character"`). Don't add legacy verbatim/pattern speakers
   to HA — they were trained on a different input distribution and surprise
   users.
+- **The Wyoming bridge runs on the BASE MODEL ONLY — no character LoRA gets
+  merged.** Speaker identity comes purely from the reference-audio upload
+  (the bridge auto-picks `training/<voice>/dataset/audio/`'s first clip).
+  Reason: merging a character LoRA on top of the base model + session-prefix
+  mechanism produces audible degradation that compounds sentence-by-sentence
+  ("stacking emotions", garbled output by sentence 3-4). The WebUI is the
+  ground truth here — it works fine when the speaker dropdown is empty, and
+  the bridge mirrors that exact request shape (`speaker: None`,
+  `use_patterns: False`, no `/models/load/<voice>` call). `scripts/serve_ha.py`
+  and `tools/wyoming_indextts.py` both have inline notes explaining this; do
+  not "fix" them by reintroducing the LoRA merge.
 - **`prepare_character_dataset.py` is the *only* path that produces
   `stutter_mask`s.** If you add a new dataset prep tool, it must emit the
   mask or the trainer will silently train at uniform weight.

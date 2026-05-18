@@ -208,14 +208,19 @@ def main() -> int:
         _cleanup()
         return 1
 
+    # NOTE: we intentionally do NOT merge any character-LoRA into the base
+    # model at startup. Empirically the merged speaker LoRA + session-prefix
+    # mechanism interact badly through the Wyoming bridge — generated audio
+    # degrades sentence-by-sentence ("stacking emotions", garbled output).
+    # The WebUI works fine when no speaker is selected, so the bridge mimics
+    # that exact path: pure base model + audio reference per request. The
+    # voice name from HA is used only to look up the reference audio file
+    # under training/<voice>/dataset/audio/ — never to load a LoRA.
+    # See docs/WYOMING_SESSION_DEBUG.md for the full debugging history.
     if DEFAULT_SPEAKER:
-        log(f"loading default speaker LoRA: {DEFAULT_SPEAKER}")
-        try:
-            out = http_post(f"http://localhost:{API_PORT}/models/load/{DEFAULT_SPEAKER}",
-                            timeout=LOAD_TIMEOUT)
-            log(f"speaker loaded: {out.get('message') or out}")
-        except Exception as e:
-            log(f"speaker load failed (will lazy-load on first HA request): {e}")
+        log(f"NOT merging character-LoRA for {DEFAULT_SPEAKER!r} — bridge runs "
+            f"on base model + audio reference only. Reference audio comes from "
+            f"training/{DEFAULT_SPEAKER}/dataset/audio/.")
 
     # Pass-through env for the bridge (it reads INDEXTTS_*)
     bridge_env = os.environ.copy()

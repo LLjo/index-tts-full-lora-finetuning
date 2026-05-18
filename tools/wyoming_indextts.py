@@ -8,9 +8,10 @@ resulting raw int16 PCM back as Wyoming `audio-chunk` events.
 Designed for the lowest possible TTFA:
   * Uses the `?raw_pcm=true` flag on /inference/stream so there is no WAV
     header to strip per chunk.
-  * Caches the currently-merged speaker LoRA — only fires /models/load/<name>
-    when the requested voice changes, so a steady stream of HA queries against
-    the same voice pays the LoRA-merge cost only once.
+  * Runs on the base model only. NO character LoRA is merged for HA-driven
+    synthesis (see docs/WYOMING_SESSION_DEBUG.md — the merged LoRA interacts
+    badly with the session-prefix mechanism and produces degraded audio).
+    Speaker identity comes purely from the reference-audio upload.
   * httpx.AsyncClient with HTTP/1.1 keep-alive so the TCP connection to the
     API stays warm across utterances.
   * Forwards each PCM chunk to HA immediately as it arrives — no batching or
@@ -389,17 +390,26 @@ def _build_request_body(
 ) -> dict:
     """Construct the JSON body for /inference/stream.
 
-    Mirrors what the WebUI sends. use_patterns=True so the API attaches whatever
-    pattern_embedding / character LoRA the speaker has. The character LoRA gets
-    merged via /models/load/<voice> — see _ensure_voice_loaded.
+    Mirrors what the WebUI sends when no speaker is selected: speaker=None,
+    use_patterns=False, audio reference uploaded separately. We deliberately
+    do NOT merge any character LoRA into the model (see top-of-file note).
 
     `session_id` plumbs cross-sentence prosody continuity — see
     docs/SESSION_CONTINUITY_PLAN.md. Pass None to disable for this call.
     """
+    # Bridge intentionally runs without speaker conditioning and without any
+    # character LoRA. The voice name from HA is used ONLY to look up the
+    # reference audio file under training/<voice>/dataset/audio/; the audio
+    # itself drives all speaker timbre/style via the upload path. Sending
+    # `speaker=<name>` here causes the API to (a) load pattern_embedding.pt
+    # when use_patterns=True, and (b) potentially trigger other speaker-keyed
+    # code paths that interact badly with session prefix injection. The
+    # WebUI works correctly when its speaker dropdown is empty — we mimic
+    # that exactly. See docs/WYOMING_SESSION_DEBUG.md.
     body: dict = {
         "text": text,
-        "speaker": voice_name,
-        "use_patterns": True,
+        "speaker": None,
+        "use_patterns": False,
         "verbose": False,
         "streaming_preset": settings["preset"],
     }
@@ -666,7 +676,10 @@ class IndexTTSHandler(AsyncEventHandler):
         session_reset: bool = False,
     ) -> None:
         api_url = self.settings["api_url"]
-        await _ensure_voice_loaded(api_url, voice_name)
+        # Deliberately do NOT call _ensure_voice_loaded(): merging the
+        # character LoRA into the GPT triggers the session-degradation bug.
+        # Bridge runs on the base model only; the voice_name argument is
+        # used solely to resolve the reference audio path below.
         body = _build_request_body(
             sentence, voice_name, self.settings,
             session_id=session_id, session_reset=session_reset,
@@ -751,8 +764,8 @@ class IndexTTSHandler(AsyncEventHandler):
         """Single-shot synthesis path: legacy `Synthesize` events. Emits a
         complete AudioStart → chunks → AudioStop session for this one text."""
         api_url = self.settings["api_url"]
-        # 1. Swap LoRA if needed (cached — usually a no-op on repeated calls)
-        await _ensure_voice_loaded(api_url, voice_name)
+        # Deliberately do NOT merge any character LoRA — see _do_post_and_queue
+        # for the rationale. voice_name is used only to pick the reference audio.
 
         # 2. Decide whether to attach a reference audio. Stored embeddings →
         #    no upload (fastest); otherwise upload one wav per request and
