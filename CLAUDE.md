@@ -14,19 +14,41 @@ changes — they encode design decisions that are not derivable from the code.
 
 ## Running it
 
+**Production path is Docker.** The project is dockerized as the `indextts`
+service in `../compose.yml`:
+
+```bash
+docker compose up -d indextts                              # start
+docker compose restart indextts                            # after editing source
+docker compose up -d --build --force-recreate indextts     # after pyproject/uv.lock change
+docker compose logs -f indextts                            # tail logs
+```
+
+The image only carries the venv at `/opt/venv` (built from `pyproject.toml` +
+`uv.lock` + a pinned flash-attn wheel). The project dir is bind-mounted to
+`/app`, so any edit to `tools/wyoming_indextts.py`, `indextts/streaming_v2.py`,
+etc. takes effect on a plain `docker compose restart indextts` — no rebuild.
+Wyoming on `:10200`, FastAPI/WebUI on `:8095` (mapped from container `:8000`).
+Both GPUs are reserved. `restart: unless-stopped`, so it comes up on boot.
+
+**Host-terminal fallback** (for dev work the container makes awkward — e.g.
+attaching a debugger, or running with `--reload`):
+
 ```bash
 bash start_api.sh        # FastAPI on :8000 (WebUI at /, API docs at /docs)
 bash start_ha.sh         # orchestrator: API + Wyoming bridge on :10200 for HA
 ```
 
 Both scripts `unset LD_LIBRARY_PATH` because the system CUDA 13.1 libs conflict
-with the cu128 wheels torch ships with. Both run inside the project venv via
+with the cu128 wheels torch ships with — the Docker container avoids this
+because its env starts clean. Both run inside the project venv via
 `uv run --no-sync`. `start_api.sh` uses `--reload`; `start_ha.sh` does not (it
 runs `scripts/serve_ha.py`, which lazy-loads the base model and the default
-speaker LoRA, then `exec`s `tools/wyoming_indextts.py`).
+speaker LoRA, then `exec`s `tools/wyoming_indextts.py`). **Stop the `indextts`
+container before running either script — they fight over port 10200.**
 
-Production/HA defaults live in `.env.indextts`:
-`INDEXTTS_DEFAULT_SPEAKER`, `INDEXTTS_STREAMING_PRESET` (typically
+Production/HA defaults live in `.env.indextts` (read by `serve_ha.py` in both
+paths): `INDEXTTS_DEFAULT_SPEAKER`, `INDEXTTS_STREAMING_PRESET` (typically
 `fast_quality` or `balanced_distilled`), and the solver overrides
 (`single_step` / 1 step / CFG 0.0) used when the distilled student is active.
 
