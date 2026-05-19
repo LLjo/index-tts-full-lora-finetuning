@@ -1,0 +1,20 @@
+# Keep the build context tiny — only pyproject.toml + uv.lock are COPY'd in.
+# Everything else is bind-mounted at runtime.
+.venv/
+checkpoints/
+training/
+archive/
+.git/
+.github/
+docs/
+tests/
+examples/
+api/static/audio/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.log
+*.wav
+*.mp3
+.env.indextts
+node_modules/
